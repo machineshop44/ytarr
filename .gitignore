@@ -1,0 +1,18 @@
+node_modules/
+dist/
+.DS_Store
+*.local
+.env
+.env.*
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+data/*.db
+library/**
+!library/.gitkeep
+data/**
+!data/.gitkeep
+# Local machine config / shortcuts
+config.yaml
+*.lnk

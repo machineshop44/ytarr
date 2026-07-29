@@ -1,0 +1,13 @@
+host: 127.0.0.1
+port: 8199
+data_dir: data
+library_root: library
+# Empty or "yt-dlp" = bundled Python module (pip install -r backend/requirements.txt).
+# Optional: absolute path to yt-dlp.exe for an external binary override.
+ytdlp_path: yt-dlp
+format: bv*+ba/b
+output_template: '%(uploader,playlist_title|Unknown)s/%(upload_date>%Y-%m-%d)s - %(title).200B [%(id)s].%(ext)s'
+poll_interval_minutes: 30
+concurrent_downloads: 1
+# Keep false for normal installs. Only set true on captive/guest Wi‑Fi that breaks HTTPS.
+nocheck_certificates: false
