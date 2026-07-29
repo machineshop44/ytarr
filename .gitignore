@@ -16,3 +16,6 @@ data/**
 # Local machine config / shortcuts
 config.yaml
 *.lnk
+
+*.dump
+
