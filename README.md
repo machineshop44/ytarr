@@ -5,11 +5,13 @@ Self-hosted Sonarr-style app for YouTube: monitor channels/playlists, download n
 ## Requirements
 
 - Python 3.12+
-- Node.js 20+ (for the UI)
-- ffmpeg recommended (for merging best video+audio)
+- Node.js 20+ (for building the UI, and for YouTube JS extraction at runtime)
+- **ffmpeg** bundled under `tools/ffmpeg/` (run `scripts\fetch-ffmpeg.ps1` on a new machine). Without it, ytarr falls back to single-file downloads.
 - Windows, macOS, or Linux
 
-**yt-dlp** is installed automatically with the backend requirements — no separate Desktop install needed. On a new machine (e.g. your Plex host), `pip install -r backend/requirements.txt` is enough.
+**Portable layout:** keep runtime helpers inside the ytarr folder (`tools/`, `data/`, `assets/`). Do not rely on a separate Desktop yt-dlp GUI install.
+
+**yt-dlp** is installed automatically with the backend requirements — no separate Desktop install needed. On a new machine: `pip install -r backend/requirements.txt`, then fetch ffmpeg as above.
 
 HTTPS certificate verification is **on by default**. On Windows, ytarr uses the OS certificate store (so VPN roots like Surfshark work). Settings has an optional “Skip HTTPS certificate checks” toggle only as a last resort on broken guest Wi‑Fi.
 
@@ -18,11 +20,12 @@ HTTPS certificate verification is **on by default**. On Windows, ytarr uses the 
 ### 1. Config
 
 ```powershell
-cd "C:\Users\machi\Desktop\yt arr app"
+cd <path-to-ytarr>
 copy config.example.yaml config.yaml
+.\scripts\fetch-ffmpeg.ps1
 ```
 
-Edit `config.yaml` if you want a different library folder (default is `./library`). Leave `ytdlp_path` as `yt-dlp` (or empty) to use the bundled module.
+Edit `config.yaml` if you want a different library folder (default is `./library` under the app). Leave `ytdlp_path` as `yt-dlp` and `ffmpeg_path` as `tools/ffmpeg/ffmpeg.exe` (or empty for auto-detect of the bundled tools folder). All relative paths resolve from the app folder.
 
 ### 2. Backend
 
@@ -57,7 +60,7 @@ Port **8199** is ytarr’s default (avoids Readarr’s 8787 and other *arr ports
 In a second terminal:
 
 ```powershell
-cd "C:\Users\machi\Desktop\yt arr app\frontend"
+cd frontend
 npm install
 npm run dev
 ```
@@ -111,5 +114,5 @@ library/
 ## Notes
 
 - v1 monitors **new uploads only** (no “download last N” backfill UI). Use Library → Seen → Download for one-offs.
-- Default format is `bv*+ba/b` merged to `.mkv`.
+- Default format is `bv*+ba/b` (merged to `.mkv` when **ffmpeg** is installed). If ffmpeg is missing, ytarr automatically uses single-file `b` so downloads still work.
 - Identity is YouTube `video_id`, not title.

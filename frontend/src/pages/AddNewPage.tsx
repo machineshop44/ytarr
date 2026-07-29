@@ -1,7 +1,8 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api, type SearchHit, type Source } from "../api";
-import { AlbumRow, findExistingPlaylist } from "../components/AlbumRow";
+import { ChannelAddModal } from "../components/ChannelAddModal";
+import { findExistingPlaylist } from "../components/playlistMatch";
 
 type SearchKind = "channel" | "playlist" | "video";
 type AddMode = "new" | "all" | "video";
@@ -30,6 +31,22 @@ async function kickQueue() {
   }
 }
 
+async function applyVideoSelection(sourceId: number, wantIds: string[] | null) {
+  if (wantIds == null) return; // whole catalog
+  const vids = await api.videos({ source_id: sourceId });
+  const want = new Set(wantIds);
+  await Promise.all(
+    vids.map((v) => {
+      if (want.has(v.video_id)) {
+        if (v.status === "seen" || v.status === "ignored") return api.retryVideo(v.id);
+        return Promise.resolve();
+      }
+      if (v.status !== "ignored" && v.status !== "downloaded") return api.ignoreVideo(v.id);
+      return Promise.resolve();
+    }),
+  );
+}
+
 export function AddNewPage() {
   const navigate = useNavigate();
   const [query, setQuery] = useState("");
@@ -42,10 +59,8 @@ export function AddNewPage() {
   const [message, setMessage] = useState<string | null>(null);
   const [added, setAdded] = useState<Source[]>([]);
   const [knownSources, setKnownSources] = useState<Source[]>([]);
-
-  const [browseChannel, setBrowseChannel] = useState<SearchHit | null>(null);
-  const [playlists, setPlaylists] = useState<SearchHit[]>([]);
-  const [loadingPlaylists, setLoadingPlaylists] = useState(false);
+  const [pickerChannel, setPickerChannel] = useState<SearchHit | null>(null);
+  const [confirming, setConfirming] = useState(false);
 
   const monitored = useMemo(() => {
     const byId = new Map<number, Source>();
@@ -61,14 +76,14 @@ export function AddNewPage() {
   }, []);
 
   const modeOptions = useMemo(() => {
-    if (kind === "video" && !browseChannel) {
+    if (kind === "video") {
       return [{ value: "video" as const, label: "Download this video" }];
     }
     return [
       { value: "all" as const, label: "All — download everything now and monitor" },
       { value: "new" as const, label: "Future — monitor new uploads only" },
     ];
-  }, [kind, browseChannel]);
+  }, [kind]);
 
   const onSearch = async (e?: FormEvent) => {
     e?.preventDefault();
@@ -77,8 +92,7 @@ export function AddNewPage() {
     setError(null);
     setMessage(null);
     setResults([]);
-    setBrowseChannel(null);
-    setPlaylists([]);
+    setPickerChannel(null);
     try {
       const res = await api.search(query.trim(), kind, 12);
       setResults(res.results);
@@ -91,31 +105,11 @@ export function AddNewPage() {
     }
   };
 
-  const openPlaylists = async (channel: SearchHit) => {
-    setBrowseChannel(channel);
-    setLoadingPlaylists(true);
-    setError(null);
-    setMessage(null);
-    setPlaylists([]);
-    try {
-      const res = await api.channelPlaylists(channel.url, 50);
-      setPlaylists(res.results);
-      if (!res.results.length) {
-        setMessage("No playlists found on this channel. You can still add the channel uploads feed.");
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoadingPlaylists(false);
-    }
-  };
-
-  const closePlaylists = () => {
-    setBrowseChannel(null);
-    setPlaylists([]);
-  };
-
   const onAdd = async (hit: SearchHit) => {
+    if (hit.kind === "channel") {
+      setPickerChannel(hit);
+      return;
+    }
     setAddingUrl(hit.url);
     setError(null);
     setMessage(null);
@@ -132,9 +126,52 @@ export function AddNewPage() {
     }
   };
 
-  const renderHit = (hit: SearchHit, opts?: { showBrowse?: boolean }) => {
-    const already =
-      monitored.some((s) => s.url === hit.url) || Boolean(findExistingPlaylist(monitored, hit));
+  const onConfirmChannel = async (selection: {
+    monitorUploads: boolean;
+    uploadVideoIds: string[] | null;
+    playlists: { hit: SearchHit; videoIds: string[] | null }[];
+  }) => {
+    if (!pickerChannel) return;
+    setConfirming(true);
+    setError(null);
+    try {
+      const channelMode = selection.monitorUploads ? "all" : "new";
+      const channelSource = await api.addSource(pickerChannel.url, channelMode);
+      if (selection.monitorUploads) {
+        await applyVideoSelection(channelSource.id, selection.uploadVideoIds);
+      }
+      setAdded((prev) => [channelSource, ...prev.filter((s) => s.id !== channelSource.id)]);
+
+      for (const { hit, videoIds } of selection.playlists) {
+        const existing = findExistingPlaylist(
+          [...knownSources, channelSource, ...added],
+          hit,
+        );
+        let pl = existing;
+        if (!pl) {
+          pl = await api.addSource(hit.url, "all");
+        } else if (!pl.enabled) {
+          await api.patchSource(pl.id, { enabled: true });
+          await api.backfillSource(pl.id);
+        } else {
+          await api.checkSource(pl.id);
+        }
+        await applyVideoSelection(pl.id, videoIds);
+        setAdded((prev) => [pl!, ...prev.filter((s) => s.id !== pl!.id)]);
+      }
+
+      await kickQueue();
+      setPickerChannel(null);
+      navigate(api.sourceDetailPath(channelSource.id));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setConfirming(false);
+    }
+  };
+
+  const renderHit = (hit: SearchHit) => {
+    const already = monitored.some((s) => s.url === hit.url);
     return (
       <article key={`${hit.kind}-${hit.id || hit.url}`} className="search-card">
         {hit.thumbnail_url ? (
@@ -158,28 +195,24 @@ export function AddNewPage() {
           </div>
           {hit.description && <p className="muted search-desc">{hit.description}</p>}
           <div className="row">
-            {opts?.showBrowse && hit.kind === "channel" && (
-              <button
-                className="btn"
-                type="button"
-                disabled={loadingPlaylists}
-                onClick={() => void openPlaylists(hit)}
-              >
-                Browse playlists
-              </button>
-            )}
             <button
               className="btn btn-primary"
               type="button"
-              disabled={already || addingUrl === hit.url}
+              disabled={
+                (hit.kind !== "channel" && already) ||
+                addingUrl === hit.url ||
+                confirming
+              }
               onClick={() => void onAdd(hit)}
             >
-              {already
-                ? "Added"
-                : addingUrl === hit.url
-                  ? "Adding…"
-                  : hit.kind === "channel"
-                    ? "Add"
+              {hit.kind === "channel"
+                ? already
+                  ? "Manage…"
+                  : "Add…"
+                : already
+                  ? "In library"
+                  : addingUrl === hit.url
+                    ? "Adding…"
                     : "Add"}
             </button>
           </div>
@@ -193,150 +226,91 @@ export function AddNewPage() {
       <div className="page-header">
         <div>
           <h1>Add New</h1>
-          <p>Search YouTube — add a channel or playlist like Series / Artists in the other Arrs.</p>
+          <p>
+            Search for a channel, then pick seasons (playlists) and episodes (videos) — like Sonarr.
+          </p>
         </div>
         <Link className="btn" to="/">
           Library
         </Link>
       </div>
 
-      {!browseChannel && (
-        <form className="panel" onSubmit={onSearch}>
-          <div className="row search-bar">
-            <div className="grow">
-              <label htmlFor="yt-search">Search YouTube</label>
-              <input
-                id="yt-search"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Channel, playlist, or video…"
-                disabled={searching}
-                autoFocus
-              />
-            </div>
-            <div>
-              <label htmlFor="yt-kind">Looking for</label>
-              <select
-                id="yt-kind"
-                value={kind}
-                disabled={searching}
-                onChange={(e) => {
-                  const next = e.target.value as SearchKind;
-                  setKind(next);
-                  setAddMode(defaultModeForKind(next));
-                }}
-              >
-                <option value="channel">Channels</option>
-                <option value="playlist">Playlists</option>
-                <option value="video">Videos</option>
-              </select>
-            </div>
-            <button
-              className="btn btn-primary"
-              type="submit"
-              disabled={searching || query.trim().length < 2}
-            >
-              {searching ? "Searching…" : "Search"}
-            </button>
+      <form className="panel" onSubmit={onSearch}>
+        <div className="row search-bar">
+          <div className="grow">
+            <label htmlFor="yt-search">Search YouTube</label>
+            <input
+              id="yt-search"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Channel, playlist, or video…"
+              disabled={searching}
+              autoFocus
+            />
           </div>
-
-          {kind !== "video" && (
-            <div className="field" style={{ marginTop: "0.75rem", marginBottom: 0 }}>
-              <label htmlFor="add-mode">Monitor</label>
-              <select
-                id="add-mode"
-                value={addMode}
-                onChange={(e) => setAddMode(e.target.value as AddMode)}
-              >
-                {modeOptions.map((opt) => (
-                  <option key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-        </form>
-      )}
-
-      {browseChannel && (
-        <div className="panel browse-header">
-          <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
-            <div>
-              <div className="muted" style={{ fontSize: "0.8rem", marginBottom: "0.25rem" }}>
-                Channel playlists
-              </div>
-              <h2 style={{ margin: 0, fontSize: "1.25rem" }}>{browseChannel.title}</h2>
-            </div>
-            <button className="btn" type="button" onClick={closePlaylists}>
-              ← Back to search
-            </button>
-          </div>
-          <div className="field" style={{ marginTop: "0.9rem", marginBottom: 0 }}>
-            <label htmlFor="add-mode-browse">Monitor</label>
+          <div>
+            <label htmlFor="yt-kind">Looking for</label>
             <select
-              id="add-mode-browse"
-              value={addMode === "video" ? "all" : addMode}
-              onChange={(e) => setAddMode(e.target.value as AddMode)}
+              id="yt-kind"
+              value={kind}
+              disabled={searching}
+              onChange={(e) => {
+                const next = e.target.value as SearchKind;
+                setKind(next);
+                setAddMode(defaultModeForKind(next));
+              }}
             >
-              <option value="all">All — download everything now and monitor</option>
-              <option value="new">Future — monitor new uploads only</option>
+              <option value="channel">Channels</option>
+              <option value="playlist">Playlists</option>
+              <option value="video">Videos</option>
             </select>
           </div>
-          <div className="row" style={{ marginTop: "0.75rem" }}>
-            <button
-              className="btn btn-primary"
-              type="button"
-              disabled={
-                monitored.some((s) => s.url === browseChannel.url) ||
-                addingUrl === browseChannel.url
-              }
-              onClick={() => void onAdd(browseChannel)}
-            >
-              {monitored.some((s) => s.url === browseChannel.url)
-                ? "Channel uploads already added"
-                : "Add channel uploads"}
-            </button>
-          </div>
+          <button
+            className="btn btn-primary"
+            type="submit"
+            disabled={searching || query.trim().length < 2}
+          >
+            {searching ? "Searching…" : "Search"}
+          </button>
         </div>
-      )}
+
+        {kind === "playlist" && (
+          <div className="field" style={{ marginTop: "0.75rem", marginBottom: 0 }}>
+            <label htmlFor="add-mode">Monitor</label>
+            <select
+              id="add-mode"
+              value={addMode}
+              onChange={(e) => setAddMode(e.target.value as AddMode)}
+            >
+              {modeOptions.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+      </form>
 
       {error && <div className="error">{error}</div>}
       {message && <div className="success">{message}</div>}
 
-      {browseChannel ? (
-        <div className="album-list">
-          {loadingPlaylists && <p className="muted">Loading playlists…</p>}
-          {!loadingPlaylists &&
-            playlists.map((hit) => (
-              <AlbumRow
-                key={hit.id || hit.url}
-                hit={hit}
-                existing={findExistingPlaylist(monitored, hit)}
-                busy={addingUrl === hit.url}
-                onOpen={(() => {
-                  const existing = findExistingPlaylist(monitored, hit);
-                  return existing
-                    ? () => navigate(api.sourceDetailPath(existing.id))
-                    : undefined;
-                })()}
-                onAdd={() => void onAdd(hit)}
-                primaryLabel="Add"
-              />
-            ))}
-        </div>
-      ) : (
-        <div className="search-results">
-          {results.map((hit) => renderHit(hit, { showBrowse: true }))}
-        </div>
+      <div className="search-results">{results.map((hit) => renderHit(hit))}</div>
+
+      {!results.length && !searching && !error && (
+        <p className="muted">
+          Tip: search <strong>Channels</strong>, click <strong>Add…</strong>, then check the
+          playlists/videos you want. Members-only videos are hidden.
+        </p>
       )}
 
-      {!browseChannel && !results.length && !searching && !error && (
-        <p className="muted">
-          Tip: search <strong>Channels</strong>, Add with Monitor <strong>All</strong> to start
-          downloading, then open the channel to grab more playlists. Or paste a URL on{" "}
-          <Link to="/sources">Sources</Link>.
-        </p>
+      {pickerChannel && (
+        <ChannelAddModal
+          channel={pickerChannel}
+          busy={confirming}
+          onClose={() => !confirming && setPickerChannel(null)}
+          onConfirm={(sel) => void onConfirmChannel(sel)}
+        />
       )}
     </>
   );

@@ -15,6 +15,8 @@ from ..schemas import (
     DashboardOut,
     DownloadJobOut,
     HealthOut,
+    PlaylistEntriesResponse,
+    PlaylistEntryOut,
     RenameApplyIn,
     RenameApplyOut,
     RenameItemOut,
@@ -163,6 +165,33 @@ def list_channel_playlists(url: str, limit: int = 50) -> SearchResponse:
     )
 
 
+@router.get("/search/entries", response_model=PlaylistEntriesResponse)
+def list_url_entries(url: str, limit: int = 100) -> PlaylistEntriesResponse:
+    """Preview videos in a channel uploads feed or playlist (members-only filtered)."""
+    target = (url or "").strip()
+    if len(target) < 8:
+        raise HTTPException(status_code=400, detail="URL required")
+    limit = max(1, min(int(limit), 200))
+    try:
+        entries = ytdlp.list_entries(target, limit=limit)
+    except ytdlp.YtDlpError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return PlaylistEntriesResponse(
+        url=target,
+        entries=[
+            PlaylistEntryOut(
+                video_id=e.video_id,
+                title=e.title,
+                published_at=e.published_at,
+                duration=e.duration,
+                thumbnail_url=e.thumbnail_url,
+                url=e.url,
+            )
+            for e in entries
+        ],
+    )
+
+
 @router.get("/sources", response_model=list[SourceOut])
 def list_sources(db: Session = Depends(get_db)) -> list[SourceOut]:
     sources = db.query(MonitoredSource).order_by(MonitoredSource.title.asc()).all()
@@ -212,6 +241,8 @@ def patch_source(
         source.enabled = body.enabled
     if body.title is not None:
         source.title = body.title
+    if body.monitor_mode is not None:
+        source.monitor_mode = body.monitor_mode
     db.add(source)
     db.commit()
     db.refresh(source)
@@ -324,6 +355,7 @@ def _job_out(job: DownloadJob) -> DownloadJobOut:
 @router.get("/queue", response_model=list[DownloadJobOut])
 def list_queue(
     status: str | None = None,
+    source_id: int | None = None,
     limit: int = 100,
     db: Session = Depends(get_db),
 ) -> list[DownloadJobOut]:
@@ -337,6 +369,8 @@ def list_queue(
     """
     limit = max(1, min(limit, 500))
     q = db.query(DownloadJob)
+    if source_id is not None:
+        q = q.join(Video, DownloadJob.video_id == Video.id).filter(Video.source_id == source_id)
     if status and status not in {"all", "*"}:
         if status == "active":
             statuses = ["queued", "downloading"]

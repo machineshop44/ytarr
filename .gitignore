@@ -19,3 +19,8 @@ config.yaml
 
 *.dump
 
+# Large bundled binaries — run scripts/fetch-ffmpeg.ps1 (kept out of git)
+tools/ffmpeg/**
+!tools/ffmpeg/.gitkeep
+!tools/README.md
+

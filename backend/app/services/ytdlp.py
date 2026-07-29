@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -32,6 +33,39 @@ class PlaylistEntry:
     duration: int | None = None
     thumbnail_url: str | None = None
     url: str | None = None
+
+
+# yt-dlp availability values we cannot download without special auth/cookies
+_BLOCKED_AVAILABILITY = {
+    "subscriber_only",
+    "premium",
+    "needs_premium",
+    "needs_auth",
+    "private",
+    "unavailable",
+}
+
+_MEMBERS_TITLE_RE = re.compile(
+    r"(\bmembers?\s*[-–—]?\s*only\b|\bmember(?:s)?\s+exclusive\b|\[members?\]|\(members?\s*only\))",
+    re.I,
+)
+
+
+def _is_undownloadable(item: dict[str, Any]) -> bool:
+    """True for members-only / premium / private entries we should hide."""
+    availability = str(item.get("availability") or "").strip().lower()
+    if availability in _BLOCKED_AVAILABILITY:
+        return True
+    title = str(item.get("title") or "")
+    if _MEMBERS_TITLE_RE.search(title):
+        return True
+    # Some flat dumps put badges in a list of strings / dicts
+    badges = item.get("badges") or item.get("availability_badges") or []
+    if isinstance(badges, list):
+        blob = " ".join(str(b) for b in badges).lower()
+        if "member" in blob or "premium" in blob or "subscriber" in blob:
+            return True
+    return False
 
 
 @dataclass
@@ -103,17 +137,125 @@ def _ytdlp_cmd() -> list[str]:
     return [configured]
 
 
+def _bundled_ffmpeg() -> Path | None:
+    """Prefer ffmpeg shipped inside the ytarr app folder."""
+    from ..config import ROOT_DIR
+
+    win = sys.platform.startswith("win")
+    name = "ffmpeg.exe" if win else "ffmpeg"
+    for rel in (
+        Path("tools") / "ffmpeg" / name,
+        Path("tools") / name,
+        Path("bin") / "ffmpeg" / name,
+        Path("bin") / name,
+    ):
+        candidate = ROOT_DIR / rel
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _ffmpeg_candidates() -> list[Path]:
+    """Fallback locations outside the app (legacy / optional)."""
+    home = Path.home()
+    desktop = home / "Desktop"
+    local = Path(os.environ.get("LOCALAPPDATA", "")) if os.environ.get("LOCALAPPDATA") else None
+    return [
+        desktop / "ytdlp" / "ffmpeg.exe",
+        desktop / "yt-dlp" / "ffmpeg.exe",
+        *(
+            [
+                local / "Programs" / "yt-dlp" / "ffmpeg.exe",
+            ]
+            if local
+            else []
+        ),
+    ]
+
+
+def resolve_ffmpeg() -> Path | None:
+    """Return path to ffmpeg binary, preferring the app's tools/ folder."""
+    cfg = get_config()
+    configured = (cfg.ffmpeg_path or "").strip()
+    if configured:
+        p = Path(configured)
+        if not p.is_absolute():
+            from ..config import ROOT_DIR
+
+            p = ROOT_DIR / p
+        if p.is_dir():
+            exe = p / ("ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg")
+            if exe.exists():
+                return exe
+        if p.exists():
+            return p
+
+    bundled = _bundled_ffmpeg()
+    if bundled:
+        return bundled
+
+    which = shutil.which("ffmpeg")
+    if which:
+        return Path(which)
+
+    for candidate in _ffmpeg_candidates():
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _ffmpeg_available() -> bool:
+    return resolve_ffmpeg() is not None
+
+
+def _ffmpeg_location_args() -> list[str]:
+    """Tell yt-dlp where ffmpeg lives (directory containing the binary)."""
+    ffmpeg = resolve_ffmpeg()
+    if not ffmpeg:
+        return []
+    # yt-dlp --ffmpeg-location accepts the binary or its directory
+    return ["--ffmpeg-location", str(ffmpeg.parent if ffmpeg.name.lower().startswith("ffmpeg") else ffmpeg)]
+
+
+def _js_runtime_args() -> list[str]:
+    """YouTube extraction increasingly needs a JS runtime (Node or Deno)."""
+    if shutil.which("node"):
+        return ["--js-runtimes", "node"]
+    if shutil.which("deno"):
+        return ["--js-runtimes", "deno"]
+    return []
+
+
+def _resolve_format(format_selector: str) -> tuple[str, bool]:
+    """Return (format, needs_merge).
+
+    ``bv*+ba`` requires ffmpeg to merge. Without ffmpeg, fall back to a
+    single progressive stream so downloads still succeed.
+    """
+    fmt = (format_selector or "bv*+ba/b").strip() or "bv*+ba/b"
+    needs_merge = "+" in fmt
+    if needs_merge and not _ffmpeg_available():
+        return "b", False
+    return fmt, needs_merge
+
+
+def _common_prefix_args() -> list[str]:
+    cfg = get_config()
+    prefix: list[str] = []
+    if cfg.nocheck_certificates:
+        prefix.append("--no-check-certificates")
+    prefix.extend(_js_runtime_args())
+    prefix.extend(_ffmpeg_location_args())
+    return prefix
+
+
 def _run(
     args: list[str],
     *,
     timeout: int | None = 120,
     capture: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    cfg = get_config()
-    prefix: list[str] = []
-    if cfg.nocheck_certificates:
-        prefix.append("--no-check-certificates")
-    cmd = [*_ytdlp_cmd(), *prefix, *args]
+    cmd = [*_ytdlp_cmd(), *_common_prefix_args(), *args]
     try:
         return subprocess.run(
             cmd,
@@ -637,6 +779,8 @@ def list_entries(url: str, *, limit: int | None = None) -> list[PlaylistEntry]:
         # Skip non-video playlist wrappers
         if item.get("_type") == "playlist":
             continue
+        if _is_undownloadable(item):
+            continue
         entries.append(
             PlaylistEntry(
                 video_id=str(vid),
@@ -741,24 +885,30 @@ def download_video(
     progress_cb: Callable[[float], None] | None = None,
 ) -> Path | None:
     library_root.mkdir(parents=True, exist_ok=True)
-    outtmpl = str(library_root / output_template)
-    cfg = get_config()
+    # Keep template separators as yt-dlp expects (/); don't let Path flip them on Windows
+    outtmpl = str(library_root).rstrip("\\/") + "/" + output_template.lstrip("/\\")
+    fmt, needs_merge = _resolve_format(format_selector)
     args = [
+        *_common_prefix_args(),
         "--newline",
+        "--retries",
+        "10",
+        "--fragment-retries",
+        "10",
         "-f",
-        format_selector,
+        fmt,
         "-o",
         outtmpl,
-        "--merge-output-format",
-        "mkv",
         "--print",
         "after_move:filepath",
         "--print",
         "filepath",
         video_url,
     ]
-    if cfg.nocheck_certificates:
-        args[0:0] = ["--no-check-certificates"]
+    if sys.platform.startswith("win"):
+        args[0:0] = ["--windows-filenames"]
+    if needs_merge:
+        args.extend(["--merge-output-format", "mkv"])
 
     cmd = [*_ytdlp_cmd(), *args]
     try:
@@ -775,9 +925,14 @@ def download_video(
         raise YtDlpError(f"yt-dlp not found ({' '.join(_ytdlp_cmd())})") from exc
 
     file_path: Path | None = None
+    tail: list[str] = []
     assert proc.stdout is not None
     for line in proc.stdout:
         line = line.rstrip()
+        if line:
+            tail.append(line)
+            if len(tail) > 40:
+                tail = tail[-40:]
         match = PROGRESS_RE.search(line)
         if match and progress_cb:
             try:
@@ -792,7 +947,27 @@ def download_video(
 
     code = proc.wait()
     if code != 0:
-        raise YtDlpError(f"yt-dlp download failed with exit code {code}")
+        err_lines = [
+            ln
+            for ln in tail
+            if ln.startswith("ERROR:")
+            or "ERROR:" in ln
+            or ln.startswith("WARNING:")
+            or "ffmpeg" in ln.lower()
+        ]
+        detail = " | ".join(err_lines[-4:]) if err_lines else (" | ".join(tail[-6:]) if tail else "no output")
+        hint = ""
+        blob = " ".join(tail).lower()
+        if "ffmpeg" in blob and not _ffmpeg_available():
+            hint = (
+                " Install ffmpeg and ensure it is on PATH for best quality "
+                "(bv*+ba merges), or keep using single-file format fallback."
+            )
+        if "unavailable" in blob:
+            hint += " This video may be private, region-locked, or removed."
+        if "javascript runtime" in blob and not _js_runtime_args():
+            hint += " Install Node.js so yt-dlp can extract YouTube formats."
+        raise YtDlpError(f"yt-dlp failed (exit {code}): {detail}.{hint}".strip())
     if progress_cb:
         progress_cb(100.0)
     return file_path

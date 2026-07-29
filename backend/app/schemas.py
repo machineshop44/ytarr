@@ -31,9 +31,24 @@ class SearchResponse(BaseModel):
     results: list[SearchHitOut]
 
 
+class PlaylistEntryOut(BaseModel):
+    video_id: str
+    title: str
+    published_at: datetime | None = None
+    duration: int | None = None
+    thumbnail_url: str | None = None
+    url: str | None = None
+
+
+class PlaylistEntriesResponse(BaseModel):
+    url: str
+    entries: list[PlaylistEntryOut]
+
+
 class SourceUpdate(BaseModel):
     enabled: bool | None = None
     title: str | None = None
+    monitor_mode: str | None = Field(default=None, pattern="^(new|all|video)$")
 
 
 class SourceOut(BaseModel):
@@ -96,6 +111,7 @@ class SettingsOut(BaseModel):
     data_dir: str
     library_root: str
     ytdlp_path: str
+    ffmpeg_path: str = ""
     format: str
     output_template: str
     poll_interval_minutes: int
@@ -106,6 +122,7 @@ class SettingsOut(BaseModel):
 class SettingsUpdate(BaseModel):
     library_root: str | None = None
     ytdlp_path: str | None = None
+    ffmpeg_path: str | None = None
     format: str | None = None
     output_template: str | None = None
     poll_interval_minutes: int | None = None

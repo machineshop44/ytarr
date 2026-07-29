@@ -39,7 +39,9 @@ export function DashboardPage() {
       <div className="page-header">
         <div>
           <h1>Library</h1>
-          <p>Channels are artists — open one to monitor playlists (albums) and videos (tracks).</p>
+          <p>
+            Channels are series — open one for seasons (playlists) and episodes (videos).
+          </p>
         </div>
         <div className="row">
           <Link className="btn btn-primary" to="/add">
@@ -77,8 +79,8 @@ export function DashboardPage() {
         <div className="panel empty-library">
           <h2 style={{ marginTop: 0 }}>No channels yet</h2>
           <p className="muted">
-            Add a <strong>channel</strong> (artist). Inside it you can check playlists and videos to
-            download — like Lidarr albums and tracks.
+            Add a <strong>channel</strong> (series). Pick seasons and episodes in the popup —
+            members-only videos are hidden.
           </p>
           <Link className="btn btn-primary" to="/add">
             Add New

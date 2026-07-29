@@ -25,6 +25,8 @@ class AppConfig(BaseModel):
     data_dir: str = str(DEFAULT_DATA_DIR)
     library_root: str = str(DEFAULT_LIBRARY_DIR)
     ytdlp_path: str = "yt-dlp"
+    # Empty = auto-detect bundled tools/ffmpeg, then PATH
+    ffmpeg_path: str = ""
     format: str = "bv*+ba/b"
     output_template: str = DEFAULT_OUTPUT_TEMPLATE
     poll_interval_minutes: int = 30
@@ -48,9 +50,15 @@ class Settings(BaseSettings):
                 if isinstance(loaded, dict):
                     data = loaded
         cfg = AppConfig(**data)
-        # Resolve relative paths against project root
-        for field in ("data_dir", "library_root"):
-            p = Path(getattr(cfg, field))
+        # Resolve relative paths against project root (portable installs)
+        for field in ("data_dir", "library_root", "ffmpeg_path", "ytdlp_path"):
+            raw = (getattr(cfg, field) or "").strip()
+            if not raw:
+                continue
+            # Keep bare command names (yt-dlp) unresolved
+            if field == "ytdlp_path" and raw in {"yt-dlp", "yt_dlp"}:
+                continue
+            p = Path(raw)
             if not p.is_absolute():
                 setattr(cfg, field, str((ROOT_DIR / p).resolve()))
         Path(cfg.data_dir).mkdir(parents=True, exist_ok=True)

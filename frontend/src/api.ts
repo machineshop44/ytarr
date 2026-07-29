@@ -65,6 +65,7 @@ export type Settings = {
   data_dir: string;
   library_root: string;
   ytdlp_path: string;
+  ffmpeg_path?: string;
   format: string;
   output_template: string;
   poll_interval_minutes: number;
@@ -88,6 +89,20 @@ export type SearchResponse = {
   query: string;
   kind: string;
   results: SearchHit[];
+};
+
+export type PlaylistEntryPreview = {
+  video_id: string;
+  title: string;
+  published_at: string | null;
+  duration: number | null;
+  thumbnail_url: string | null;
+  url: string | null;
+};
+
+export type PlaylistEntriesResponse = {
+  url: string;
+  entries: PlaylistEntryPreview[];
 };
 
 export type RenameItem = {
@@ -163,13 +178,17 @@ export const api = {
     const params = new URLSearchParams({ url, limit: String(limit) });
     return request<SearchResponse>(`/api/search/playlists?${params}`);
   },
+  playlistEntries: (url: string, limit = 100) => {
+    const params = new URLSearchParams({ url, limit: String(limit) });
+    return request<PlaylistEntriesResponse>(`/api/search/entries?${params}`);
+  },
   addSource: (url: string, mode: "new" | "all" | "video" = "all") =>
     request<Source>("/api/sources", {
       method: "POST",
       body: JSON.stringify({ url, mode }),
     }),
   sourceDetailPath: (id: number) => `/channel/${id}`,
-  patchSource: (id: number, body: { enabled?: boolean; title?: string }) =>
+  patchSource: (id: number, body: { enabled?: boolean; title?: string; monitor_mode?: string }) =>
     request<Source>(`/api/sources/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteSource: (id: number) =>
     request<{ ok: boolean }>(`/api/sources/${id}`, { method: "DELETE" }),
@@ -190,10 +209,11 @@ export const api = {
     request<Video>(`/api/videos/${id}/retry`, { method: "POST" }),
   ignoreVideo: (id: number) =>
     request<Video>(`/api/videos/${id}/ignore`, { method: "POST" }),
-  queue: (params?: { status?: string; limit?: number }) => {
+  queue: (params?: { status?: string; limit?: number; source_id?: number }) => {
     const q = new URLSearchParams();
     if (params?.status) q.set("status", params.status);
     if (params?.limit != null) q.set("limit", String(params.limit));
+    if (params?.source_id != null) q.set("source_id", String(params.source_id));
     const qs = q.toString();
     return request<DownloadJob[]>(`/api/queue${qs ? `?${qs}` : ""}`);
   },

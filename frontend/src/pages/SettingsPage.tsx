@@ -7,6 +7,7 @@ const empty: Settings = {
   data_dir: "",
   library_root: "",
   ytdlp_path: "yt-dlp",
+  ffmpeg_path: "",
   format: "bv*+ba/b",
   output_template: "",
   poll_interval_minutes: 30,
@@ -85,6 +86,20 @@ export function SettingsPage() {
             Leave as <span className="mono">yt-dlp</span> or empty to use the bundled Python module (
             <span className="mono">python -m yt_dlp</span>). Set an absolute path to{" "}
             <span className="mono">yt-dlp.exe</span> only for an external binary.
+          </p>
+        </div>
+        <div className="field">
+          <label htmlFor="ffmpeg_path">ffmpeg path</label>
+          <input
+            id="ffmpeg_path"
+            value={form.ffmpeg_path || ""}
+            onChange={set("ffmpeg_path")}
+            placeholder="tools/ffmpeg/ffmpeg.exe (bundled)"
+          />
+          <p className="muted" style={{ margin: "0.35rem 0 0", fontSize: "0.82rem" }}>
+            Prefer a path <strong>inside this app</strong> (e.g.{" "}
+            <span className="mono">tools/ffmpeg/ffmpeg.exe</span>). Empty = auto-detect that folder,
+            then PATH. On a new machine run <span className="mono">scripts\fetch-ffmpeg.ps1</span>.
           </p>
         </div>
         <div className="field">
