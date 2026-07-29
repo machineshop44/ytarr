@@ -9,8 +9,20 @@ class SourceCreate(BaseModel):
     url: str = Field(min_length=8)
     # new = monitor future uploads only
     # all = download entire channel/playlist now + keep monitoring
+    # none = list catalog but never auto-queue (structure only / episode picks)
     # video = download this one video only
-    mode: str = Field(default="all", pattern="^(new|all|video)$")
+    mode: str = Field(default="all", pattern="^(new|all|video|none)$")
+    # Empty = inherit Settings default_quality
+    quality: str = ""
+    # video = library_root; audio = extract to music_library_root
+    media_type: str = Field(default="video", pattern="^(video|audio)$")
+    # When set, ONLY these YouTube ids are wanted; everything else is ignored.
+    # Omit (null) for full-season monitor. Pass [] for monitor-none / no downloads.
+    wanted_video_ids: list[str] | None = None
+    # Optional hints from search UI — skip a slow yt-dlp resolve when present
+    title: str | None = None
+    yt_id: str | None = None
+    thumbnail_url: str | None = None
 
 
 class SearchHitOut(BaseModel):
@@ -31,6 +43,32 @@ class SearchResponse(BaseModel):
     results: list[SearchHitOut]
 
 
+class DiscoverHitOut(BaseModel):
+    kind: str
+    title: str
+    url: str
+    id: str | None = None
+    channel: str | None = None
+    thumbnail_url: str | None = None
+    duration: int | None = None
+    description: str | None = None
+    video_count: int | None = None
+    already_added: bool = False
+
+
+class DiscoverSectionOut(BaseModel):
+    tag: str
+    source: str
+    based_on: str | None = None
+    weight: int = 0
+    results: list[DiscoverHitOut]
+
+
+class DiscoverResponse(BaseModel):
+    sections: list[DiscoverSectionOut]
+    library_channels: int = 0
+
+
 class PlaylistEntryOut(BaseModel):
     video_id: str
     title: str
@@ -48,7 +86,9 @@ class PlaylistEntriesResponse(BaseModel):
 class SourceUpdate(BaseModel):
     enabled: bool | None = None
     title: str | None = None
-    monitor_mode: str | None = Field(default=None, pattern="^(new|all|video)$")
+    monitor_mode: str | None = Field(default=None, pattern="^(new|all|video|none)$")
+    quality: str | None = None
+    media_type: str | None = Field(default=None, pattern="^(video|audio)$")
 
 
 class SourceOut(BaseModel):
@@ -59,6 +99,8 @@ class SourceOut(BaseModel):
     source_type: str
     enabled: bool
     monitor_mode: str
+    quality: str = ""
+    media_type: str = "video"
     folder_name: str
     poster_path: str | None
     fanart_path: str | None
@@ -105,32 +147,55 @@ class DownloadJobOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class PathMappingOut(BaseModel):
+    host_path: str = ""
+    plex_path: str = ""
+
+
 class SettingsOut(BaseModel):
     host: str
     port: int
     data_dir: str
     library_root: str
+    music_library_root: str = ""
     ytdlp_path: str
     ffmpeg_path: str = ""
+    default_quality: str = "best"
     format: str
     output_template: str
+    music_output_template: str = ""
     poll_interval_minutes: int
     concurrent_downloads: int
+    downloads_paused: bool = False
     nocheck_certificates: bool
+    sponsorblock_remove: bool = True
+    sponsorblock_categories_video: str = "sponsor,selfpromo,interaction,intro,outro"
+    sponsorblock_categories_music: str = (
+        "music_offtopic,sponsor,selfpromo,interaction,intro,outro"
+    )
+    path_mappings: list[PathMappingOut] = []
 
 
 class SettingsUpdate(BaseModel):
     library_root: str | None = None
+    music_library_root: str | None = None
     ytdlp_path: str | None = None
     ffmpeg_path: str | None = None
+    default_quality: str | None = None
     format: str | None = None
     output_template: str | None = None
+    music_output_template: str | None = None
     poll_interval_minutes: int | None = None
     concurrent_downloads: int | None = None
+    downloads_paused: bool | None = None
     host: str | None = None
     port: int | None = None
     data_dir: str | None = None
     nocheck_certificates: bool | None = None
+    sponsorblock_remove: bool | None = None
+    sponsorblock_categories_video: str | None = None
+    sponsorblock_categories_music: str | None = None
+    path_mappings: list[PathMappingOut] | None = None
 
 
 class RenameItemOut(BaseModel):

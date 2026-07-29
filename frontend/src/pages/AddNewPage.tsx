@@ -1,8 +1,9 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { type FormEvent, useEffect, useMemo, useState } from "react";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { api, type SearchHit, type Source } from "../api";
 import { ChannelAddModal } from "../components/ChannelAddModal";
 import { findExistingPlaylist } from "../components/playlistMatch";
+import { MEDIA_TYPE_OPTIONS, QUALITY_OPTIONS } from "../qualityOptions";
 
 type SearchKind = "channel" | "playlist" | "video";
 type AddMode = "new" | "all" | "video";
@@ -31,30 +32,17 @@ async function kickQueue() {
   }
 }
 
-async function applyVideoSelection(sourceId: number, wantIds: string[] | null) {
-  if (wantIds == null) return; // whole catalog
-  const vids = await api.videos({ source_id: sourceId });
-  const want = new Set(wantIds);
-  await Promise.all(
-    vids.map((v) => {
-      if (want.has(v.video_id)) {
-        if (v.status === "seen" || v.status === "ignored") return api.retryVideo(v.id);
-        return Promise.resolve();
-      }
-      if (v.status !== "ignored" && v.status !== "downloaded") return api.ignoreVideo(v.id);
-      return Promise.resolve();
-    }),
-  );
-}
-
 export function AddNewPage() {
   const navigate = useNavigate();
-  const [query, setQuery] = useState("");
+  const [searchParams] = useSearchParams();
+  const [query, setQuery] = useState(() => searchParams.get("q") || "");
   const [kind, setKind] = useState<SearchKind>("channel");
   const [results, setResults] = useState<SearchHit[]>([]);
   const [searching, setSearching] = useState(false);
   const [addingUrl, setAddingUrl] = useState<string | null>(null);
   const [addMode, setAddMode] = useState<AddMode>("all");
+  const [quality, setQuality] = useState("");
+  const [mediaType, setMediaType] = useState<"video" | "audio">("video");
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [added, setAdded] = useState<Source[]>([]);
@@ -74,6 +62,26 @@ export function AddNewPage() {
       .then(setKnownSources)
       .catch(() => undefined);
   }, []);
+
+  useEffect(() => {
+    const q = searchParams.get("q");
+    if (q && q.trim().length >= 2) {
+      setQuery(q);
+      void (async () => {
+        setSearching(true);
+        setError(null);
+        try {
+          const res = await api.search(q.trim(), "channel", 12);
+          setResults(res.results);
+          setAddMode(defaultModeForKind("channel"));
+        } catch (err) {
+          setError(err instanceof Error ? err.message : String(err));
+        } finally {
+          setSearching(false);
+        }
+      })();
+    }
+  }, [searchParams]);
 
   const modeOptions = useMemo(() => {
     if (kind === "video") {
@@ -115,7 +123,10 @@ export function AddNewPage() {
     setMessage(null);
     try {
       const mode = hit.kind === "video" ? "video" : addMode;
-      const source = await api.addSource(hit.url, mode);
+      const source = await api.addSource(hit.url, mode, {
+        quality,
+        media_type: mediaType,
+      });
       setAdded((prev) => [source, ...prev.filter((s) => s.id !== source.id)]);
       await kickQueue();
       navigate(api.sourceDetailPath(source.id));
@@ -135,11 +146,26 @@ export function AddNewPage() {
     setConfirming(true);
     setError(null);
     try {
-      const channelMode = selection.monitorUploads ? "all" : "new";
-      const channelSource = await api.addSource(pickerChannel.url, channelMode);
-      if (selection.monitorUploads) {
-        await applyVideoSelection(channelSource.id, selection.uploadVideoIds);
-      }
+      // Sonarr-like: unchecked Uploads → structure only (none). Checked + all → all.
+      // Checked + episode picks → only those ids (server ignores the rest).
+      const channelMode = selection.monitorUploads
+        ? selection.uploadVideoIds != null
+          ? "none"
+          : "all"
+        : "none";
+      const baseOpts = {
+        quality,
+        media_type: mediaType,
+        title: pickerChannel.title,
+        yt_id: pickerChannel.id,
+        thumbnail_url: pickerChannel.thumbnail_url,
+      };
+      const channelSource = await api.addSource(pickerChannel.url, channelMode, {
+        ...baseOpts,
+        ...(selection.monitorUploads && selection.uploadVideoIds != null
+          ? { wanted_video_ids: selection.uploadVideoIds }
+          : {}),
+      });
       setAdded((prev) => [channelSource, ...prev.filter((s) => s.id !== channelSource.id)]);
 
       for (const { hit, videoIds } of selection.playlists) {
@@ -148,15 +174,31 @@ export function AddNewPage() {
           hit,
         );
         let pl = existing;
+        const playlistMode = videoIds != null ? "none" : "all";
+        const playlistOpts = {
+          ...baseOpts,
+          ...(videoIds != null ? { wanted_video_ids: videoIds } : {}),
+        };
         if (!pl) {
-          pl = await api.addSource(hit.url, "all");
+          pl = await api.addSource(hit.url, playlistMode, playlistOpts);
         } else if (!pl.enabled) {
-          await api.patchSource(pl.id, { enabled: true });
-          await api.backfillSource(pl.id);
+          await api.patchSource(pl.id, {
+            enabled: true,
+            monitor_mode: playlistMode,
+            quality,
+            media_type: mediaType,
+          });
+          if (videoIds != null) {
+            // Re-apply selection without pulling ignored via backfill
+            await api.addSource(hit.url, playlistMode, playlistOpts);
+          } else {
+            await api.backfillSource(pl.id, false);
+          }
+        } else if (videoIds != null) {
+          await api.addSource(hit.url, playlistMode, playlistOpts);
         } else {
           await api.checkSource(pl.id);
         }
-        await applyVideoSelection(pl.id, videoIds);
         setAdded((prev) => [pl!, ...prev.filter((s) => s.id !== pl!.id)]);
       }
 
@@ -290,6 +332,43 @@ export function AddNewPage() {
             </select>
           </div>
         )}
+
+        <div className="row" style={{ marginTop: "0.75rem", gap: "0.75rem" }}>
+          <div className="field grow" style={{ marginBottom: 0 }}>
+            <label htmlFor="add-quality">Quality</label>
+            <select
+              id="add-quality"
+              value={quality}
+              onChange={(e) => setQuality(e.target.value)}
+            >
+              {QUALITY_OPTIONS.map((o) => (
+                <option key={o.value || "default"} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="field grow" style={{ marginBottom: 0 }}>
+            <label htmlFor="add-media-type">Media type</label>
+            <select
+              id="add-media-type"
+              value={mediaType}
+              onChange={(e) => setMediaType(e.target.value as "video" | "audio")}
+            >
+              {MEDIA_TYPE_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+        {mediaType === "audio" && (
+          <p className="muted" style={{ margin: "0.5rem 0 0", fontSize: "0.82rem" }}>
+            Music mode strips audio (m4a) into the music library — useful for one-off songs from
+            music videos.
+          </p>
+        )}
       </form>
 
       {error && <div className="error">{error}</div>}
@@ -299,8 +378,9 @@ export function AddNewPage() {
 
       {!results.length && !searching && !error && (
         <p className="muted">
-          Tip: search <strong>Channels</strong>, click <strong>Add…</strong>, then check the
-          playlists/videos you want. Members-only videos are hidden.
+          Tip: leave <strong>Uploads</strong> unchecked unless you want the channel feed. Expand a
+          playlist and tick only the episodes you want — like Sonarr seasons/episodes. Members-only
+          videos are hidden.
         </p>
       )}
 

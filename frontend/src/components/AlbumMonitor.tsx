@@ -3,8 +3,10 @@ import type { SearchHit, Source } from "../api";
 
 type AlbumMonitorRowProps = {
   title: string;
-  subtitle?: string;
-  thumbnailUrl?: string | null;
+  /** e.g. file size / extra note shown after progress */
+  detail?: string;
+  downloaded?: number;
+  total?: number;
   monitored: boolean;
   busy?: boolean;
   expanded?: boolean;
@@ -13,11 +15,12 @@ type AlbumMonitorRowProps = {
   children?: ReactNode;
 };
 
-/** Lidarr-style album row: monitor check + expand for tracks. */
+/** Sonarr-style season row: monitor bookmark · title · progress badge · expand. */
 export function AlbumMonitorRow({
   title,
-  subtitle,
-  thumbnailUrl,
+  detail,
+  downloaded = 0,
+  total = 0,
   monitored,
   busy,
   expanded,
@@ -25,10 +28,22 @@ export function AlbumMonitorRow({
   onToggleExpand,
   children,
 }: AlbumMonitorRowProps) {
+  const progressClass =
+    total > 0 && downloaded >= total
+      ? "season-progress-ok"
+      : downloaded > 0
+        ? "season-progress-partial"
+        : "season-progress-empty";
+
   return (
-    <article className={`album-monitor ${expanded ? "expanded" : ""} ${monitored ? "is-monitored" : ""}`}>
-      <div className="album-monitor-main">
-        <label className="monitor-check" title={monitored ? "Monitored — click to unmonitor" : "Click to monitor & download"}>
+    <article
+      className={`season-row ${expanded ? "expanded" : ""} ${monitored ? "is-monitored" : ""}`}
+    >
+      <div className="season-row-main">
+        <label
+          className="monitor-check season-monitor"
+          title={monitored ? "Monitored — click to unmonitor" : "Click to monitor"}
+        >
           <input
             type="checkbox"
             checked={monitored}
@@ -38,39 +53,33 @@ export function AlbumMonitorRow({
               onToggleMonitor();
             }}
           />
-          <span className="monitor-check-box" aria-hidden />
+          <span className="monitor-bookmark" aria-hidden />
         </label>
         <button
           type="button"
-          className="album-monitor-hit"
+          className="season-row-hit"
           onClick={onToggleExpand}
           disabled={!onToggleExpand}
         >
-          {thumbnailUrl ? (
-            <img className="album-thumb" src={thumbnailUrl} alt="" />
-          ) : (
-            <div className="album-thumb placeholder">—</div>
-          )}
-          <div className="album-body">
-            <div className="album-title-row">
-              <h3>{title}</h3>
-              {monitored && <span className="badge">monitored</span>}
-            </div>
-            {subtitle && <div className="source-meta">{subtitle}</div>}
-          </div>
+          <span className="season-title">{title}</span>
+          <span className={`season-progress ${progressClass}`}>
+            {downloaded} / {total || "—"}
+          </span>
+          {detail ? <span className="season-detail muted">{detail}</span> : <span />}
           {onToggleExpand && (
-            <span className="album-chevron" aria-hidden>
+            <span className="season-chevron" aria-hidden>
               {expanded ? "▾" : "▸"}
             </span>
           )}
         </button>
       </div>
-      {expanded && children && <div className="album-tracks">{children}</div>}
+      {expanded && children != null && <div className="season-episodes">{children}</div>}
     </article>
   );
 }
 
 type TrackMonitorRowProps = {
+  index: number;
   title: string;
   status: string;
   published?: string | null;
@@ -79,7 +88,9 @@ type TrackMonitorRowProps = {
   onToggle: () => void;
 };
 
+/** Sonarr-style episode row inside an expanded season. */
 export function TrackMonitorRow({
+  index,
   title,
   status,
   published,
@@ -88,17 +99,44 @@ export function TrackMonitorRow({
   onToggle,
 }: TrackMonitorRowProps) {
   return (
-    <label className={`track-monitor ${checked ? "is-wanted" : ""}`}>
-      <input type="checkbox" checked={checked} disabled={busy} onChange={onToggle} />
-      <span className="monitor-check-box" aria-hidden />
-      <span className="track-monitor-body">
-        <span className="track-title">{title}</span>
-        <span className="track-meta">
-          <span className="badge">{status}</span>
-          {published && <span className="muted">{published}</span>}
-        </span>
-      </span>
-    </label>
+    <tr className={`episode-row ${checked ? "is-monitored" : ""}`}>
+      <td className="episode-mon">
+        <label className="monitor-check" title={checked ? "Monitored" : "Unmonitored"}>
+          <input type="checkbox" checked={checked} disabled={busy} onChange={onToggle} />
+          <span className="monitor-bookmark" aria-hidden />
+        </label>
+      </td>
+      <td className="episode-num mono">{index}</td>
+      <td className="episode-title">
+        <div>{title}</div>
+        <div className="episode-status-mobile">
+          <span className={`badge ${status}`}>{status}</span>
+        </div>
+      </td>
+      <td className="episode-air mono muted">{published || "—"}</td>
+      <td className="episode-status">
+        <span className={`badge ${status}`}>{status}</span>
+      </td>
+    </tr>
+  );
+}
+
+export function EpisodeTable({ children }: { children: ReactNode }) {
+  return (
+    <div className="table-wrap episode-table-wrap">
+      <table className="episode-table">
+        <thead>
+          <tr>
+            <th className="episode-mon" aria-label="Monitor" />
+            <th className="episode-num">#</th>
+            <th>Title</th>
+            <th>Published</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>{children}</tbody>
+      </table>
+    </div>
   );
 }
 
@@ -114,7 +152,7 @@ export function albumSubtitle(hit: SearchHit, existing?: Source | null): string 
   return parts.join(" · ");
 }
 
-/** Track is selected for download library (Lidarr “monitored”). */
+/** Episode is selected for download library (Sonarr “monitored”). */
 export function trackIsMonitored(status: string): boolean {
   return !["seen", "ignored"].includes(status);
 }

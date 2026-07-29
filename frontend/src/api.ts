@@ -6,6 +6,8 @@ export type Source = {
   source_type: string;
   enabled: boolean;
   monitor_mode: string;
+  quality: string;
+  media_type: string;
   folder_name: string;
   poster_path: string | null;
   fanart_path: string | null;
@@ -59,18 +61,31 @@ export type Dashboard = {
   ytdlp_version: string | null;
 };
 
+export type PathMapping = {
+  host_path: string;
+  plex_path: string;
+};
+
 export type Settings = {
   host: string;
   port: number;
   data_dir: string;
   library_root: string;
+  music_library_root: string;
   ytdlp_path: string;
   ffmpeg_path?: string;
+  default_quality: string;
   format: string;
   output_template: string;
+  music_output_template: string;
   poll_interval_minutes: number;
   concurrent_downloads: number;
+  downloads_paused: boolean;
   nocheck_certificates: boolean;
+  sponsorblock_remove: boolean;
+  sponsorblock_categories_video: string;
+  sponsorblock_categories_music: string;
+  path_mappings: PathMapping[];
 };
 
 export type SearchHit = {
@@ -89,6 +104,23 @@ export type SearchResponse = {
   query: string;
   kind: string;
   results: SearchHit[];
+};
+
+export type DiscoverHit = SearchHit & {
+  already_added?: boolean;
+};
+
+export type DiscoverSection = {
+  tag: string;
+  source: string;
+  based_on: string | null;
+  weight: number;
+  results: DiscoverHit[];
+};
+
+export type DiscoverResponse = {
+  sections: DiscoverSection[];
+  library_channels: number;
 };
 
 export type PlaylistEntryPreview = {
@@ -174,6 +206,14 @@ export const api = {
     });
     return request<SearchResponse>(`/api/search?${params}`);
   },
+  discover: (opts?: { max_tags?: number; per_tag?: number; enrich?: boolean }) => {
+    const params = new URLSearchParams();
+    if (opts?.max_tags != null) params.set("max_tags", String(opts.max_tags));
+    if (opts?.per_tag != null) params.set("per_tag", String(opts.per_tag));
+    if (opts?.enrich != null) params.set("enrich", opts.enrich ? "true" : "false");
+    const qs = params.toString();
+    return request<DiscoverResponse>(`/api/discover${qs ? `?${qs}` : ""}`);
+  },
   channelPlaylists: (url: string, limit = 50) => {
     const params = new URLSearchParams({ url, limit: String(limit) });
     return request<SearchResponse>(`/api/search/playlists?${params}`);
@@ -182,26 +222,74 @@ export const api = {
     const params = new URLSearchParams({ url, limit: String(limit) });
     return request<PlaylistEntriesResponse>(`/api/search/entries?${params}`);
   },
-  addSource: (url: string, mode: "new" | "all" | "video" = "all") =>
+  addSource: (
+    url: string,
+    mode: "new" | "all" | "video" | "none" = "all",
+    opts?: {
+      quality?: string;
+      media_type?: "video" | "audio";
+      wanted_video_ids?: string[] | null;
+      title?: string | null;
+      yt_id?: string | null;
+      thumbnail_url?: string | null;
+    },
+  ) =>
     request<Source>("/api/sources", {
       method: "POST",
-      body: JSON.stringify({ url, mode }),
+      body: JSON.stringify({
+        url,
+        mode,
+        quality: opts?.quality ?? "",
+        media_type: opts?.media_type ?? "video",
+        ...(opts && "wanted_video_ids" in opts
+          ? { wanted_video_ids: opts.wanted_video_ids }
+          : {}),
+        ...(opts?.title ? { title: opts.title } : {}),
+        ...(opts?.yt_id ? { yt_id: opts.yt_id } : {}),
+        ...(opts?.thumbnail_url ? { thumbnail_url: opts.thumbnail_url } : {}),
+      }),
     }),
   sourceDetailPath: (id: number) => `/channel/${id}`,
-  patchSource: (id: number, body: { enabled?: boolean; title?: string; monitor_mode?: string }) =>
+  patchSource: (
+    id: number,
+    body: {
+      enabled?: boolean;
+      title?: string;
+      monitor_mode?: string;
+      quality?: string;
+      media_type?: string;
+    },
+  ) =>
     request<Source>(`/api/sources/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
-  deleteSource: (id: number) =>
-    request<{ ok: boolean }>(`/api/sources/${id}`, { method: "DELETE" }),
+  deleteSource: (id: number, opts?: { deleteFiles?: boolean }) => {
+    const q = opts?.deleteFiles ? "?delete_files=true" : "";
+    return request<{
+      ok: boolean;
+      delete_files?: boolean;
+      removed?: string[];
+      errors?: string[];
+    }>(`/api/sources/${id}${q}`, { method: "DELETE" });
+  },
   checkSource: (id: number) =>
     request<Record<string, unknown>>(`/api/sources/${id}/check`, { method: "POST" }),
-  backfillSource: (id: number) =>
-    request<Record<string, unknown>>(`/api/sources/${id}/backfill`, { method: "POST" }),
+  checkAllSources: () =>
+    request<{ ok: boolean; checked: number; results: Record<string, unknown>[] }>(
+      "/api/sources/check-all",
+      { method: "POST" },
+    ),
+  backfillSource: (id: number, includeIgnored = false) => {
+    const q = includeIgnored ? "?include_ignored=true" : "";
+    return request<Record<string, unknown>>(`/api/sources/${id}/backfill${q}`, {
+      method: "POST",
+    });
+  },
   refreshArtwork: (id: number) =>
     request<Source>(`/api/sources/${id}/refresh-artwork`, { method: "POST" }),
-  videos: (params?: { status?: string; source_id?: number }) => {
+  videos: (params?: { status?: string; source_id?: number; limit?: number }) => {
     const q = new URLSearchParams();
     if (params?.status) q.set("status", params.status);
     if (params?.source_id) q.set("source_id", String(params.source_id));
+    if (params?.limit != null) q.set("limit", String(params.limit));
     const qs = q.toString();
     return request<Video[]>(`/api/videos${qs ? `?${qs}` : ""}`);
   },
@@ -218,11 +306,24 @@ export const api = {
     return request<DownloadJob[]>(`/api/queue${qs ? `?${qs}` : ""}`);
   },
   processQueue: () => request<{ ok: boolean }>("/api/queue/process", { method: "POST" }),
+  pauseQueue: () =>
+    request<{ ok: boolean; downloads_paused: boolean }>("/api/queue/pause", {
+      method: "POST",
+    }),
+  resumeQueue: () =>
+    request<{ ok: boolean; downloads_paused: boolean }>("/api/queue/resume", {
+      method: "POST",
+    }),
+  clearQueue: () =>
+    request<{ ok: boolean; cancelled: number; downloads_paused: boolean }>("/api/queue/clear", {
+      method: "POST",
+    }),
   retryQueueJob: (id: number) =>
     request<DownloadJob>(`/api/queue/${id}/retry`, { method: "POST" }),
   cancelQueueJob: (id: number) =>
     request<DownloadJob>(`/api/queue/${id}/cancel`, { method: "POST" }),
   posterUrl: (id: number) => `/api/sources/${id}/poster`,
+  fanartUrl: (id: number) => `/api/sources/${id}/fanart`,
   renamePreview: (sourceId?: number) => {
     const q = new URLSearchParams();
     if (sourceId != null) q.set("source_id", String(sourceId));

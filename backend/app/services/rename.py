@@ -1,9 +1,22 @@
-"""Rename/organize downloaded files to ytarr's Plex-friendly naming scheme."""
+"""Rename/organize downloaded files to a Plex-friendly naming scheme.
+
+Recommended layout (Personal Media / Local Assets — date-based shows):
+
+  LibraryRoot/
+    Channel Name/
+      poster.jpg
+      fanart.jpg
+      YYYY-MM-DD - Episode Title [youtubeId].ext
+
+Never invent 0000-00-00. If the upload date is unknown, omit the date prefix.
+Channel name lives in the folder — do not repeat it in the filename.
+"""
 from __future__ import annotations
 
 import re
 import shutil
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy.orm import Session
@@ -13,7 +26,8 @@ from ..models import MonitoredSource, Video, VideoStatus
 
 
 _ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-_ID_IN_NAME = re.compile(r"\[([A-Za-z0-9_-]{6,})\]")
+_DATE_IN_NAME = re.compile(r"(?<!\d)(20\d{2}|19\d{2})[-_.](\d{2})[-_.](\d{2})(?!\d)")
+_COMPACT_DATE = re.compile(r"(?<!\d)((?:20|19)\d{2})(\d{2})(\d{2})(?!\d)")
 
 
 @dataclass
@@ -34,16 +48,54 @@ def _safe_name(text: str, max_len: int = 180) -> str:
     return (cleaned[:max_len] or "Untitled").rstrip(" .")
 
 
-def _date_prefix(video: Video) -> str:
+def _date_from_filename(name: str) -> str | None:
+    m = _DATE_IN_NAME.search(name)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    m = _COMPACT_DATE.search(name)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    return None
+
+
+def _date_prefix(video: Video, current: Path | None = None) -> str | None:
+    """Return YYYY-MM-DD or None — never fabricate 0000-00-00."""
     if video.published_at:
         return video.published_at.strftime("%Y-%m-%d")
-    return "0000-00-00"
+    if current:
+        parsed = _date_from_filename(current.name)
+        if parsed:
+            return parsed
+        try:
+            ts = current.stat().st_mtime
+            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        except OSError:
+            pass
+    return None
 
 
-def desired_relative_path(source: MonitoredSource, video: Video, ext: str) -> Path:
+def desired_relative_path(
+    source: MonitoredSource,
+    video: Video,
+    ext: str,
+    *,
+    current: Path | None = None,
+) -> Path:
     folder = _safe_name(source.folder_name or source.title or "Unknown")
-    filename = f"{_date_prefix(video)} - {_safe_name(video.title, 200)} [{video.video_id}].{ext.lstrip('.')}"
+    title = _safe_name(video.title, 200)
+    date = _date_prefix(video, current)
+    if date:
+        filename = f"{date} - {title} [{video.video_id}].{ext.lstrip('.')}"
+    else:
+        filename = f"{title} [{video.video_id}].{ext.lstrip('.')}"
     return Path(folder) / filename
+
+
+def _library_root_for(source: MonitoredSource | None) -> Path:
+    cfg = get_config()
+    if source and (source.media_type or "video") == "audio":
+        return Path(cfg.music_library_root)
+    return Path(cfg.library_root)
 
 
 def _find_file_by_id(library_root: Path, video_id: str) -> Path | None:
@@ -68,9 +120,29 @@ def _resolve_current(library_root: Path, video: Video) -> Path | None:
     return _find_file_by_id(library_root, video.video_id)
 
 
-def preview_renames(db: Session, source_id: int | None = None) -> list[RenamePlan]:
+def apply_path_mapping(path: str) -> str:
+    """Translate a host library path to the Plex-visible path when mappings exist."""
     cfg = get_config()
-    library_root = Path(cfg.library_root)
+    mappings = getattr(cfg, "path_mappings", None) or []
+    if not mappings or not path:
+        return path
+    normalized = path.replace("/", "\\")
+    for mapping in mappings:
+        host = (mapping.host_path or "").strip().rstrip("\\/")
+        plex = (mapping.plex_path or "").strip().rstrip("\\/")
+        if not host or not plex:
+            continue
+        host_n = host.replace("/", "\\")
+        if normalized.lower().startswith(host_n.lower()):
+            rest = normalized[len(host_n) :]
+            # Preserve plex path separators when plex looks POSIX
+            if "/" in plex and "\\" not in plex:
+                return plex.rstrip("/") + rest.replace("\\", "/")
+            return plex.rstrip("\\/") + rest
+    return path
+
+
+def preview_renames(db: Session, source_id: int | None = None) -> list[RenamePlan]:
     q = (
         db.query(Video)
         .join(MonitoredSource)
@@ -83,7 +155,18 @@ def preview_renames(db: Session, source_id: int | None = None) -> list[RenamePla
     plans: list[RenamePlan] = []
     for video in videos:
         source = video.source
+        library_root = _library_root_for(source)
         current = _resolve_current(library_root, video)
+        if not current:
+            # Also try the other root in case media_type was switched
+            cfg = get_config()
+            alt = Path(cfg.library_root)
+            if alt != library_root:
+                current = _resolve_current(alt, video)
+            if not current:
+                alt = Path(cfg.music_library_root)
+                if alt != library_root:
+                    current = _resolve_current(alt, video)
         if not current:
             plans.append(
                 RenamePlan(
@@ -99,7 +182,7 @@ def preview_renames(db: Session, source_id: int | None = None) -> list[RenamePla
             )
             continue
 
-        rel = desired_relative_path(source, video, current.suffix)
+        rel = desired_relative_path(source, video, current.suffix, current=current)
         target = library_root / rel
         needs = current.resolve() != target.resolve()
         plans.append(
@@ -156,7 +239,6 @@ def apply_renames(
                 db.add(video)
             renamed += 1
 
-            # Clean empty leftover folders (but never delete folder with poster/fanart)
             try:
                 parent = src.parent
                 if parent.exists() and not any(parent.iterdir()):

@@ -8,11 +8,14 @@ from fastapi.responses import FileResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from ..config import get_config, set_config
+from ..config import get_config, set_config, resolve_paths
 from ..db import get_db
 from ..models import DownloadJob, MonitoredSource, Video, VideoStatus
 from ..schemas import (
     DashboardOut,
+    DiscoverHitOut,
+    DiscoverResponse,
+    DiscoverSectionOut,
     DownloadJobOut,
     HealthOut,
     PlaylistEntriesResponse,
@@ -30,7 +33,7 @@ from ..schemas import (
     SourceUpdate,
     VideoOut,
 )
-from ..services import downloader, monitor, rename, scheduler
+from ..services import discover, downloader, monitor, rename, scheduler
 from ..services import ytdlp
 
 router = APIRouter(prefix="/api")
@@ -51,6 +54,8 @@ def _source_out(db: Session, source: MonitoredSource) -> SourceOut:
         source_type=source.source_type,
         enabled=source.enabled,
         monitor_mode=source.monitor_mode,
+        quality=getattr(source, "quality", "") or "",
+        media_type=getattr(source, "media_type", "video") or "video",
         folder_name=source.folder_name,
         poster_path=source.poster_path,
         fanart_path=source.fanart_path,
@@ -118,9 +123,7 @@ def update_settings(body: SettingsUpdate) -> SettingsOut:
     for key, value in body.model_dump(exclude_unset=True).items():
         if value is not None:
             data[key] = value
-    updated = set_config(type(cfg)(**data))
-    Path(updated.library_root).mkdir(parents=True, exist_ok=True)
-    Path(updated.data_dir).mkdir(parents=True, exist_ok=True)
+    updated = set_config(resolve_paths(type(cfg)(**data)))
     try:
         scheduler.reschedule_monitor()
     except Exception:
@@ -145,6 +148,46 @@ def search_youtube(
         query=query,
         kind=kind,
         results=[SearchHitOut(**h.__dict__) for h in hits],
+    )
+
+
+@router.get("/discover", response_model=DiscoverResponse)
+def discover_similar(
+    max_tags: int = 8,
+    per_tag: int = 8,
+    enrich: bool = True,
+    db: Session = Depends(get_db),
+) -> DiscoverResponse:
+    """Radarr Discover — suggest channels from tags/topics in your library."""
+    max_tags = max(1, min(int(max_tags), 12))
+    per_tag = max(1, min(int(per_tag), 12))
+    try:
+        sections = discover.discover_from_library(
+            db,
+            max_tags=max_tags,
+            per_tag=per_tag,
+            enrich_remote=enrich,
+        )
+    except ytdlp.YtDlpError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    channel_count = (
+        db.query(MonitoredSource)
+        .filter(MonitoredSource.source_type == "channel")
+        .count()
+    )
+    return DiscoverResponse(
+        library_channels=channel_count,
+        sections=[
+            DiscoverSectionOut(
+                tag=s.tag,
+                source=s.source,
+                based_on=s.based_on,
+                weight=s.weight,
+                results=[DiscoverHitOut(**h.__dict__) for h in s.results],
+            )
+            for s in sections
+        ],
     )
 
 
@@ -201,7 +244,17 @@ def list_sources(db: Session = Depends(get_db)) -> list[SourceOut]:
 @router.post("/sources", response_model=SourceOut)
 def create_source(body: SourceCreate, db: Session = Depends(get_db)) -> SourceOut:
     try:
-        source = monitor.add_source(db, body.url, mode=body.mode)
+        source = monitor.add_source(
+            db,
+            body.url,
+            mode=body.mode,
+            quality=body.quality or "",
+            media_type=body.media_type or "video",
+            wanted_video_ids=body.wanted_video_ids,
+            title=body.title,
+            yt_id=body.yt_id,
+            thumbnail_url=body.thumbnail_url,
+        )
     except ytdlp.YtDlpError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ValueError as exc:
@@ -212,12 +265,19 @@ def create_source(body: SourceCreate, db: Session = Depends(get_db)) -> SourceOu
 
 
 @router.post("/sources/{source_id}/backfill")
-def backfill_source(source_id: int, db: Session = Depends(get_db)) -> dict:
+def backfill_source(
+    source_id: int,
+    include_ignored: bool = False,
+    db: Session = Depends(get_db),
+) -> dict:
     source = db.get(MonitoredSource, source_id)
     if not source:
         raise HTTPException(status_code=404, detail="Source not found")
     try:
-        return {"ok": True, **monitor.backfill_source(db, source)}
+        return {
+            "ok": True,
+            **monitor.backfill_source(db, source, include_ignored=include_ignored),
+        }
     except ytdlp.YtDlpError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -243,6 +303,10 @@ def patch_source(
         source.title = body.title
     if body.monitor_mode is not None:
         source.monitor_mode = body.monitor_mode
+    if body.quality is not None:
+        source.quality = body.quality.strip().lower()
+    if body.media_type is not None:
+        source.media_type = body.media_type
     db.add(source)
     db.commit()
     db.refresh(source)
@@ -250,13 +314,37 @@ def patch_source(
 
 
 @router.delete("/sources/{source_id}")
-def delete_source(source_id: int, db: Session = Depends(get_db)) -> dict:
+def delete_source(
+    source_id: int,
+    delete_files: bool = False,
+    db: Session = Depends(get_db),
+) -> dict:
     source = db.get(MonitoredSource, source_id)
     if not source:
         raise HTTPException(status_code=404, detail="Source not found")
+    files_result: dict = {"removed": [], "errors": []}
+    if delete_files:
+        # Load videos before cascade delete removes them
+        _ = list(source.videos)
+        files_result = monitor.delete_source_files(source)
     db.delete(source)
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "delete_files": delete_files, **files_result}
+
+
+@router.post("/sources/check-all")
+def check_all_sources(db: Session = Depends(get_db)) -> dict:
+    """Sonarr-style Update All / RSS Sync — refresh every enabled source."""
+    try:
+        results = monitor.check_all_enabled(db)
+        downloader.enqueue_wanted(db)
+        return {
+            "ok": True,
+            "checked": len(results),
+            "results": results,
+        }
+    except ytdlp.YtDlpError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/sources/{source_id}/check")
@@ -292,19 +380,36 @@ def source_poster(source_id: int, db: Session = Depends(get_db)):
     return FileResponse(source.poster_path)
 
 
+@router.get("/sources/{source_id}/fanart")
+def source_fanart(source_id: int, db: Session = Depends(get_db)):
+    source = db.get(MonitoredSource, source_id)
+    path = None
+    if source and source.fanart_path and Path(source.fanart_path).exists():
+        path = source.fanart_path
+    elif source and source.poster_path and Path(source.poster_path).exists():
+        path = source.poster_path
+    if not path:
+        raise HTTPException(status_code=404, detail="Fanart not found")
+    return FileResponse(path)
+
+
 @router.get("/videos", response_model=list[VideoOut])
 def list_videos(
     status: str | None = None,
     source_id: int | None = None,
-    limit: int = 200,
+    limit: int = 2000,
     db: Session = Depends(get_db),
 ) -> list[VideoOut]:
+    # limit=0 means no cap (selection / admin); otherwise clamp
     q = db.query(Video).join(MonitoredSource)
     if status:
         q = q.filter(Video.status == status)
     if source_id:
         q = q.filter(Video.source_id == source_id)
-    rows = q.order_by(Video.published_at.desc(), Video.id.desc()).limit(limit).all()
+    q = q.order_by(Video.published_at.desc(), Video.id.desc())
+    if limit and limit > 0:
+        q = q.limit(min(limit, 20000))
+    rows = q.all()
     out: list[VideoOut] = []
     for v in rows:
         item = VideoOut.model_validate(v)
@@ -335,7 +440,9 @@ def ignore_video(video_id: int, db: Session = Depends(get_db)) -> VideoOut:
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
     video.status = VideoStatus.IGNORED.value
+    video.error = "Ignored"
     db.add(video)
+    monitor.cancel_jobs_for_video(db, video, reason="Ignored")
     db.commit()
     db.refresh(video)
     item = VideoOut.model_validate(video)
@@ -391,6 +498,32 @@ def list_queue(
 def process_queue() -> dict:
     downloader.worker_tick()
     return {"ok": True}
+
+
+@router.post("/queue/pause")
+def pause_queue() -> dict:
+    cfg = get_config()
+    cfg.downloads_paused = True
+    set_config(cfg)
+    return {"ok": True, "downloads_paused": True}
+
+
+@router.post("/queue/resume")
+def resume_queue() -> dict:
+    cfg = get_config()
+    cfg.downloads_paused = False
+    set_config(cfg)
+    return {"ok": True, "downloads_paused": False}
+
+
+@router.post("/queue/clear")
+def clear_queue(db: Session = Depends(get_db)) -> dict:
+    """Panic stop: cancel all queued jobs and clear wanted items."""
+    cfg = get_config()
+    cfg.downloads_paused = True
+    set_config(cfg)
+    cancelled = downloader.cancel_all_queued(db)
+    return {"ok": True, "cancelled": cancelled, "downloads_paused": True}
 
 
 @router.post("/queue/{job_id}/retry", response_model=DownloadJobOut)

@@ -12,31 +12,42 @@ function formatWhen(iso: string | null) {
   }
 }
 
-export function ActivityPage() {
-  const [tab, setTab] = useState<Tab>("queue");
+type ActivityPageProps = {
+  tab?: Tab;
+};
+
+export function ActivityPage({ tab = "queue" }: ActivityPageProps) {
   const [jobs, setJobs] = useState<DownloadJob[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [busyId, setBusyId] = useState<number | null>(null);
+  const [paused, setPaused] = useState(false);
 
   const load = async (nextTab = tab) => {
-    const data =
+    const [data, settings] = await Promise.all([
       nextTab === "queue"
-        ? await api.queue({ status: "active", limit: 200 })
-        : await api.queue({ status: "history", limit: 100 });
+        ? api.queue({ status: "active", limit: 200 })
+        : api.queue({ status: "history", limit: 100 }),
+      api.settings(),
+    ]);
     setJobs(data);
+    setPaused(Boolean(settings.downloads_paused));
   };
 
   useEffect(() => {
     let alive = true;
     const tick = async () => {
       try {
-        const data =
+        const [data, settings] = await Promise.all([
           tab === "queue"
-            ? await api.queue({ status: "active", limit: 200 })
-            : await api.queue({ status: "history", limit: 100 });
+            ? api.queue({ status: "active", limit: 200 })
+            : api.queue({ status: "history", limit: 100 }),
+          api.settings(),
+        ]);
         if (alive) {
           setJobs(data);
+          setPaused(Boolean(settings.downloads_paused));
           setError(null);
         }
       } catch (err) {
@@ -63,50 +74,89 @@ export function ActivityPage() {
     <>
       <div className="page-header">
         <div>
-          <h1>Activity</h1>
-          <p>Built-in yt-dlp downloads — queue progress and recent history.</p>
+          <h1>{tab === "queue" ? "Queue" : "History"}</h1>
+          <p>
+            {tab === "queue"
+              ? "Active and queued yt-dlp downloads."
+              : "Recent download history for this instance."}
+          </p>
         </div>
         {tab === "queue" && (
-          <button
-            className="btn"
-            type="button"
-            disabled={busy}
-            onClick={() => {
-              setBusy(true);
-              void api
-                .processQueue()
-                .then(() => load())
-                .catch((err) => setError(err instanceof Error ? err.message : String(err)))
-                .finally(() => setBusy(false));
-            }}
-          >
-            Process now
-          </button>
+          <div className="row" style={{ gap: "0.5rem", flexWrap: "wrap" }}>
+            <button
+              className="btn"
+              type="button"
+              disabled={busy}
+              onClick={() => {
+                setBusy(true);
+                setMessage(null);
+                void (paused ? api.resumeQueue() : api.pauseQueue())
+                  .then((r) => {
+                    setPaused(r.downloads_paused);
+                    setMessage(r.downloads_paused ? "Downloads paused." : "Downloads resumed.");
+                    return load();
+                  })
+                  .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+                  .finally(() => setBusy(false));
+              }}
+            >
+              {paused ? "Resume" : "Pause"}
+            </button>
+            <button
+              className="btn btn-ghost"
+              type="button"
+              disabled={busy}
+              title="Cancel everything queued and pause downloads"
+              onClick={() => {
+                if (
+                  !window.confirm(
+                    "Clear the entire download queue and pause downloads?\n\nQueued items become ignored.",
+                  )
+                ) {
+                  return;
+                }
+                setBusy(true);
+                setMessage(null);
+                void api
+                  .clearQueue()
+                  .then((r) => {
+                    setPaused(true);
+                    setMessage(`Cleared ${r.cancelled} item(s). Downloads paused.`);
+                    return load();
+                  })
+                  .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+                  .finally(() => setBusy(false));
+              }}
+            >
+              Clear queue
+            </button>
+            <button
+              className="btn"
+              type="button"
+              disabled={busy || paused}
+              onClick={() => {
+                setBusy(true);
+                void api
+                  .processQueue()
+                  .then(() => load())
+                  .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+                  .finally(() => setBusy(false));
+              }}
+            >
+              Process now
+            </button>
+          </div>
         )}
       </div>
 
-      <div className="tabs" role="tablist">
-        <button
-          type="button"
-          role="tab"
-          className={`tab ${tab === "queue" ? "active" : ""}`}
-          aria-selected={tab === "queue"}
-          onClick={() => setTab("queue")}
-        >
-          Queue
-        </button>
-        <button
-          type="button"
-          role="tab"
-          className={`tab ${tab === "history" ? "active" : ""}`}
-          aria-selected={tab === "history"}
-          onClick={() => setTab("history")}
-        >
-          History
-        </button>
-      </div>
+      {paused && (
+        <div className="error" style={{ marginBottom: "0.75rem" }}>
+          Downloads are paused. Free disk space if needed, then click Resume.
+        </div>
+      )}
 
       {error && <div className="error">{error}</div>}
+      {message && <div className="success">{message}</div>}
 
       <div className="panel table-wrap">
         <table>

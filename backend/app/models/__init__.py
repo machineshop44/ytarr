@@ -29,6 +29,10 @@ class MonitoredSource(Base):
     source_type: Mapped[str] = mapped_column(String(32), nullable=False, default="channel")
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     monitor_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="new")
+    # Empty = inherit Settings default_quality
+    quality: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    # video = muxed A/V into library_root; audio = extract to music_library_root
+    media_type: Mapped[str] = mapped_column(String(16), nullable=False, default="video")
     folder_name: Mapped[str] = mapped_column(String(512), nullable=False, default="Unknown")
     poster_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     fanart_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
@@ -46,7 +50,10 @@ class MonitoredSource(Base):
 
 class Video(Base):
     __tablename__ = "videos"
-    __table_args__ = (UniqueConstraint("video_id", name="uq_videos_video_id"),)
+    # Same YouTube id may appear under channel Uploads and a playlist season
+    __table_args__ = (
+        UniqueConstraint("source_id", "video_id", name="uq_videos_source_video"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     source_id: Mapped[int] = mapped_column(ForeignKey("monitored_sources.id", ondelete="CASCADE"))

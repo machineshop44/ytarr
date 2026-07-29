@@ -2,14 +2,29 @@ host: 127.0.0.1
 port: 8199
 # Relative paths are resolved from the ytarr app folder (portable).
 data_dir: data
+# Prefer absolute paths on the Plex machine when library is on another drive, e.g. E:\Media\YouTube
 library_root: library
+music_library_root: music
+# Optional Sonarr-style mappings (host path ytarr writes ↔ path Plex sees)
+path_mappings: []
+#  - host_path: D:\YouTube
+#    plex_path: \\NAS\media\YouTube
 # Empty or "yt-dlp" = bundled Python module (pip install -r backend/requirements.txt).
 ytdlp_path: yt-dlp
 # Empty = auto-detect tools/ffmpeg inside this app, then PATH.
 # Or set a path relative to the app folder, e.g. tools/ffmpeg/ffmpeg.exe
 ffmpeg_path: tools/ffmpeg/ffmpeg.exe
+# Named preset: best | 2160p | 1080p | 720p | 480p | worst | custom
+default_quality: best
+# Used when default_quality (or a source's quality) is "custom"
 format: bv*+ba/b
+# Plex Personal Media date-based: Channel/YYYY-MM-DD - Title [id].ext
 output_template: '%(uploader,playlist_title|Unknown)s/%(upload_date>%Y-%m-%d)s - %(title).200B [%(id)s].%(ext)s'
+music_output_template: '%(uploader,artist|Unknown)s/%(title).200B [%(id)s].%(ext)s'
 poll_interval_minutes: 30
 concurrent_downloads: 1
 nocheck_certificates: false
+# Cut SponsorBlock-marked segments (ffmpeg). Unmarked videos are unchanged.
+sponsorblock_remove: true
+sponsorblock_categories_video: sponsor,selfpromo,interaction,intro,outro
+sponsorblock_categories_music: music_offtopic,sponsor,selfpromo,interaction,intro,outro

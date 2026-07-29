@@ -28,6 +28,12 @@ async def lifespan(_app: FastAPI):
         pass
     get_config()
     init_db()
+    try:
+        from .services import downloader
+
+        downloader.recover_interrupted_downloads()
+    except Exception:
+        pass
     start_scheduler()
     try:
         yield

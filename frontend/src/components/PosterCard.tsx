@@ -5,12 +5,24 @@ type PosterCardProps = {
   source: Source;
 };
 
+function qualityLabel(quality: string | undefined): string {
+  const q = (quality || "").trim();
+  if (!q || q === "best") return "Any";
+  return q;
+}
+
 export function PosterCard({ source }: PosterCardProps) {
   const progress =
     source.video_count > 0
       ? `${source.downloaded_count}/${source.video_count}`
-      : `${source.downloaded_count} downloaded`;
-  const wantedHint = source.wanted_count > 0 ? `${source.wanted_count} wanted` : null;
+      : `${source.downloaded_count} dl`;
+  const monitored =
+    source.enabled && source.monitor_mode !== "none" && source.monitor_mode !== "video";
+  const statusClass = !monitored
+    ? "poster-status-off"
+    : source.wanted_count > 0
+      ? "poster-status-wanted"
+      : "poster-status-ok";
 
   return (
     <Link to={api.sourceDetailPath(source.id)} className="poster-card">
@@ -20,19 +32,23 @@ export function PosterCard({ source }: PosterCardProps) {
         ) : (
           <div className="poster-card-placeholder">No poster</div>
         )}
-        {!source.enabled && <span className="poster-card-badge muted-badge">Off</span>}
-        {source.enabled && source.wanted_count > 0 && (
+        {!monitored && <span className="poster-card-badge muted-badge">Off</span>}
+        {monitored && source.wanted_count > 0 && (
           <span className="poster-card-badge wanted-badge">{source.wanted_count}</span>
         )}
+        <div className={`poster-status-bar ${statusClass}`} />
       </div>
       <div className="poster-card-meta">
         <div className="poster-card-title" title={source.title}>
           {source.title}
         </div>
-        <div className="poster-card-sub">
-          <span className="badge">{source.source_type}</span>
+        <div className="poster-card-line">
+          {monitored ? "Monitored" : "Unmonitored"}
+        </div>
+        <div className="poster-card-line muted">
+          <span>{qualityLabel(source.quality)}</span>
+          <span>·</span>
           <span>{progress}</span>
-          {wantedHint && <span>{wantedHint}</span>}
         </div>
       </div>
     </Link>

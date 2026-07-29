@@ -537,6 +537,53 @@ def search_youtube(
     return hits
 
 
+def channel_topic_tags(channel_url: str) -> list[str]:
+    """Pull tags/categories from a channel (and a few recent uploads) via yt-dlp."""
+    result = _run(
+        [
+            "--dump-single-json",
+            "--flat-playlist",
+            "--playlist-end",
+            "8",
+            "--no-download",
+            channel_url,
+        ],
+        timeout=90,
+    )
+    if result.returncode != 0 or not result.stdout:
+        return []
+    try:
+        info = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+    raw: list[str] = []
+    for key in ("tags", "categories"):
+        val = info.get(key)
+        if isinstance(val, list):
+            raw.extend(str(x) for x in val if x)
+    for entry in info.get("entries") or []:
+        if not isinstance(entry, dict):
+            continue
+        for key in ("tags", "categories"):
+            val = entry.get(key)
+            if isinstance(val, list):
+                raw.extend(str(x) for x in val if x)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        text = re.sub(r"\s+", " ", str(item).strip())
+        if len(text) < 3 or len(text) > 48:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out[:12]
+
+
 def _channel_playlists_url(channel_url: str) -> str:
     """Normalize a channel URL to its /playlists tab."""
     raw = channel_url.strip().rstrip("/")
@@ -655,16 +702,21 @@ def list_channel_playlists(channel_url: str, *, limit: int = 50) -> list[SearchH
         str(limit),
         playlists_url,
     ]
-    result = _run(args, timeout=180)
+    result = _run(args, timeout=90)
     if result.returncode != 0:
         raise YtDlpError(
             (result.stderr or result.stdout or "Failed to list channel playlists").strip()
         )
 
-    # Video counts live on the channel playlists tab badges — not in flat-playlist JSON.
+    # Optional badge counts — do not block the add UI if this scrape is slow.
     counts: dict[str, int] = {}
     try:
-        counts = _playlist_counts_from_channel_html(_ydl_fetch_html(playlists_url))
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(_ydl_fetch_html, playlists_url)
+            html = fut.result(timeout=8)
+            counts = _playlist_counts_from_channel_html(html)
     except Exception:
         counts = {}
 
@@ -786,13 +838,22 @@ def list_entries(url: str, *, limit: int | None = None) -> list[PlaylistEntry]:
                 video_id=str(vid),
                 title=str(item.get("title") or "Untitled"),
                 published_at=_parse_upload_date(
-                    item.get("upload_date") or item.get("timestamp") or item.get("release_timestamp")
+                    item.get("upload_date")
+                    or item.get("release_date")
+                    or item.get("timestamp")
+                    or item.get("release_timestamp")
+                    or item.get("epoch")
                 ),
                 duration=int(item["duration"]) if item.get("duration") else None,
                 thumbnail_url=item.get("thumbnail") or _pick_best_thumbnail(item.get("thumbnails")),
                 url=item.get("url") or item.get("webpage_url"),
             )
         )
+    # Prefer newest-first when dates exist (Uploads / dated playlists)
+    entries.sort(
+        key=lambda e: e.published_at or datetime.min,
+        reverse=True,
+    )
     return entries
 
 
@@ -876,6 +937,39 @@ def fetch_channel_artwork(
     return poster_path, fanart_path
 
 
+_SPONSORBLOCK_ALLOWED = frozenset(
+    {
+        "sponsor",
+        "intro",
+        "outro",
+        "selfpromo",
+        "preview",
+        "filler",
+        "interaction",
+        "music_offtopic",
+        "hook",
+        "all",
+        "default",
+    }
+)
+
+
+def _normalize_sponsorblock_categories(raw: str | None) -> str | None:
+    """Return a sanitized comma list, or None when empty/disabled."""
+    if not raw or not str(raw).strip():
+        return None
+    parts: list[str] = []
+    for token in str(raw).replace(" ", "").split(","):
+        if not token:
+            continue
+        # Allow yt-dlp exclusion syntax: -filler
+        key = token[1:] if token.startswith("-") else token
+        if key.lower() not in _SPONSORBLOCK_ALLOWED:
+            continue
+        parts.append(token.lower() if not token.startswith("-") else f"-{key.lower()}")
+    return ",".join(parts) if parts else None
+
+
 def download_video(
     video_url: str,
     *,
@@ -883,10 +977,23 @@ def download_video(
     output_template: str,
     format_selector: str,
     progress_cb: Callable[[float], None] | None = None,
+    extract_audio: bool = False,
+    sponsorblock_categories: str | None = None,
 ) -> Path | None:
     library_root.mkdir(parents=True, exist_ok=True)
     # Keep template separators as yt-dlp expects (/); don't let Path flip them on Windows
     outtmpl = str(library_root).rstrip("\\/") + "/" + output_template.lstrip("/\\")
+    sb_cats = _normalize_sponsorblock_categories(sponsorblock_categories)
+    if extract_audio and not _ffmpeg_available():
+        raise YtDlpError(
+            "ffmpeg is required for Music (audio) downloads. "
+            "Install tools/ffmpeg (scripts\\fetch-ffmpeg.ps1) or set ffmpeg_path in Settings."
+        )
+    if sb_cats and not _ffmpeg_available():
+        raise YtDlpError(
+            "ffmpeg is required to cut SponsorBlock segments. "
+            "Install tools/ffmpeg or disable SponsorBlock remove in Settings."
+        )
     fmt, needs_merge = _resolve_format(format_selector)
     args = [
         *_common_prefix_args(),
@@ -907,8 +1014,12 @@ def download_video(
     ]
     if sys.platform.startswith("win"):
         args[0:0] = ["--windows-filenames"]
-    if needs_merge:
+    if extract_audio:
+        args.extend(["-x", "--audio-format", "m4a", "--audio-quality", "0"])
+    elif needs_merge:
         args.extend(["--merge-output-format", "mkv"])
+    if sb_cats:
+        args.extend(["--sponsorblock-remove", sb_cats])
 
     cmd = [*_ytdlp_cmd(), *args]
     try:

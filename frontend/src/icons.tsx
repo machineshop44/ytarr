@@ -95,6 +95,34 @@ export function IconSettings(props: IconProps) {
   );
 }
 
+export function IconWanted(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M12 3.5L21 19.5H3L12 3.5z" />
+      <path d="M12 10v4.5M12 17.2h.01" />
+    </Svg>
+  );
+}
+
+export function IconDiscover(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <circle cx="11" cy="11" r="6.5" />
+      <path d="M20 20l-3.2-3.2" />
+      <path d="M8.5 11h5M11 8.5v5" opacity="0.85" />
+    </Svg>
+  );
+}
+
+export function IconSystem(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <rect x="3.5" y="4.5" width="17" height="12" rx="1.5" />
+      <path d="M8 20.5h8M12 16.5v4" />
+    </Svg>
+  );
+}
+
 /** Servarr-style circular brand mark */
 export function BrandMark({ size = 36 }: { size?: number }) {
   return (

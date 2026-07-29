@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api, type Source } from "../api";
+import { MEDIA_TYPE_OPTIONS, QUALITY_OPTIONS } from "../qualityOptions";
 
 type AddMode = "new" | "all" | "video";
 
@@ -23,6 +24,8 @@ export function SourcesPage() {
   const [sources, setSources] = useState<Source[]>([]);
   const [url, setUrl] = useState("");
   const [mode, setMode] = useState<AddMode>("all");
+  const [quality, setQuality] = useState("");
+  const [mediaType, setMediaType] = useState<"video" | "audio">("video");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -50,9 +53,11 @@ export function SourcesPage() {
     setError(null);
     setMessage(null);
     try {
-      const source = await api.addSource(url.trim(), mode);
+      const source = await api.addSource(url.trim(), mode, { quality, media_type: mediaType });
       setUrl("");
       setMode("all");
+      setQuality("");
+      setMediaType("video");
       try {
         await api.processQueue();
       } catch {
@@ -155,6 +160,39 @@ export function SourcesPage() {
           A channel link does <strong>not</strong> pull every playlist — only the uploads feed. Open
           the channel in the Library to pick playlists.
         </p>
+
+        <div className="row" style={{ gap: "0.75rem" }}>
+          <div className="field grow">
+            <label htmlFor="src-quality">Quality</label>
+            <select
+              id="src-quality"
+              value={quality}
+              disabled={busy}
+              onChange={(e) => setQuality(e.target.value)}
+            >
+              {QUALITY_OPTIONS.map((o) => (
+                <option key={o.value || "default"} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="field grow">
+            <label htmlFor="src-media">Media type</label>
+            <select
+              id="src-media"
+              value={mediaType}
+              disabled={busy}
+              onChange={(e) => setMediaType(e.target.value as "video" | "audio")}
+            >
+              {MEDIA_TYPE_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
 
         <div className="row">
           <button className="btn btn-primary" type="submit" disabled={busy || !url.trim()}>
@@ -263,8 +301,16 @@ export function SourcesPage() {
                   type="button"
                   disabled={actionId === source.id}
                   onClick={() => {
-                    if (!window.confirm(`Remove ${source.title}?`)) return;
-                    void runAction(source.id, () => api.deleteSource(source.id), "Removed");
+                    if (!window.confirm(`Remove “${source.title}” from the library?`)) return;
+                    const wipe = window.confirm(
+                      `Also delete files for “${source.title}” from disk?\n\n` +
+                        `OK = delete folder/files\nCancel = keep files on disk`,
+                    );
+                    void runAction(
+                      source.id,
+                      () => api.deleteSource(source.id, { deleteFiles: wipe }),
+                      wipe ? "Removed (files deleted)" : "Removed (files kept)",
+                    );
                   }}
                 >
                   Remove

@@ -1,86 +1,155 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, type Dashboard, type Source } from "../api";
+import { api, type Source } from "../api";
 import { PosterCard } from "../components/PosterCard";
 
+type SortKey = "title" | "wanted" | "downloaded";
+type FilterKey = "all" | "monitored" | "unmonitored" | "wanted";
+
 export function DashboardPage() {
-  const [data, setData] = useState<Dashboard | null>(null);
   const [sources, setSources] = useState<Source[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [sort, setSort] = useState<SortKey>("title");
+  const [filter, setFilter] = useState<FilterKey>("all");
+  const [query, setQuery] = useState("");
+
+  const load = async () => {
+    setSources(await api.sources());
+  };
 
   useEffect(() => {
     let alive = true;
-    const load = async () => {
+    const tick = async () => {
       try {
-        const [d, s] = await Promise.all([api.dashboard(), api.sources()]);
-        if (!alive) return;
-        setData(d);
-        setSources(s);
-        setError(null);
+        await load();
+        if (alive) setError(null);
       } catch (err) {
-        if (!alive) return;
-        setError(err instanceof Error ? err.message : String(err));
+        if (alive) setError(err instanceof Error ? err.message : String(err));
       }
     };
-    void load();
-    const id = window.setInterval(load, 5000);
+    void tick();
+    const id = window.setInterval(tick, 5000);
     return () => {
       alive = false;
       window.clearInterval(id);
     };
   }, []);
 
-  // Lidarr artists = channels only. Playlists live inside the channel.
-  const channels = sources.filter((s) => s.source_type === "channel");
+  const channels = useMemo(() => {
+    let list = sources.filter((s) => s.source_type === "channel");
+    const q = query.trim().toLowerCase();
+    if (q) list = list.filter((s) => s.title.toLowerCase().includes(q));
+    if (filter === "monitored") list = list.filter((s) => s.enabled);
+    if (filter === "unmonitored") list = list.filter((s) => !s.enabled);
+    if (filter === "wanted") list = list.filter((s) => s.wanted_count > 0);
+    list = [...list].sort((a, b) => {
+      if (sort === "wanted") return b.wanted_count - a.wanted_count || a.title.localeCompare(b.title);
+      if (sort === "downloaded")
+        return b.downloaded_count - a.downloaded_count || a.title.localeCompare(b.title);
+      return a.title.localeCompare(b.title);
+    });
+    return list;
+  }, [sources, sort, filter, query]);
+
   const orphanPlaylists = sources.filter((s) => s.source_type === "playlist");
+
+  const refreshAll = async () => {
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const result = await api.checkAllSources();
+      await api.processQueue();
+      await load();
+      setMessage(`Checked ${result.checked} monitored source(s).`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const refreshArtworkAll = async () => {
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const channelsOnly = sources.filter((s) => s.source_type === "channel");
+      for (const ch of channelsOnly) {
+        try {
+          await api.refreshArtwork(ch.id);
+        } catch {
+          /* continue */
+        }
+      }
+      await load();
+      setMessage(`Refreshed artwork for ${channelsOnly.length} channel(s).`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <>
-      <div className="page-header">
-        <div>
-          <h1>Library</h1>
-          <p>
-            Channels are series — open one for seasons (playlists) and episodes (videos).
-          </p>
-        </div>
-        <div className="row">
-          <Link className="btn btn-primary" to="/add">
-            Add New
-          </Link>
-          <Link className="btn" to="/activity">
-            Activity
-            {data && data.queue_size > 0 ? ` (${data.queue_size})` : ""}
-          </Link>
-        </div>
+      <div className="page-toolbar">
+        <button className="btn" type="button" disabled={busy} onClick={() => void refreshAll()}>
+          {busy ? "Working…" : "Update All"}
+        </button>
+        <button
+          className="btn"
+          type="button"
+          disabled={busy}
+          onClick={() => void refreshArtworkAll()}
+        >
+          Refresh Art
+        </button>
+        <Link className="btn btn-primary" to="/add">
+          Add New
+        </Link>
+        <div className="page-toolbar-spacer" />
+        <input
+          className="toolbar-search"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search library"
+          aria-label="Search library"
+        />
+        <select
+          className="toolbar-select"
+          value={sort}
+          onChange={(e) => setSort(e.target.value as SortKey)}
+          aria-label="Sort"
+        >
+          <option value="title">Sort: Title</option>
+          <option value="wanted">Sort: Wanted</option>
+          <option value="downloaded">Sort: Downloaded</option>
+        </select>
+        <select
+          className="toolbar-select"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value as FilterKey)}
+          aria-label="Filter"
+        >
+          <option value="all">Filter: All</option>
+          <option value="monitored">Monitored</option>
+          <option value="unmonitored">Unmonitored</option>
+          <option value="wanted">Has wanted</option>
+        </select>
       </div>
 
       {error && <div className="error">{error}</div>}
-
-      <div className="stats stats-compact">
-        <div className="stat">
-          <div className="stat-label">Wanted</div>
-          <div className="stat-value">{data?.wanted ?? "—"}</div>
-        </div>
-        <div className="stat">
-          <div className="stat-label">Queue</div>
-          <div className="stat-value">{data?.queue_size ?? "—"}</div>
-        </div>
-        <div className="stat">
-          <div className="stat-label">Downloaded</div>
-          <div className="stat-value">{data?.downloaded ?? "—"}</div>
-        </div>
-        <div className="stat">
-          <div className="stat-label">Failed</div>
-          <div className="stat-value">{data?.failed ?? "—"}</div>
-        </div>
-      </div>
+      {message && <div className="success">{message}</div>}
 
       {!channels.length && !error && (
         <div className="panel empty-library">
           <h2 style={{ marginTop: 0 }}>No channels yet</h2>
           <p className="muted">
-            Add a <strong>channel</strong> (series). Pick seasons and episodes in the popup —
-            members-only videos are hidden.
+            Add a <strong>channel</strong> (series). Pick seasons (playlists) and episodes (videos)
+            like Lidarr albums/tracks — members-only videos stay hidden.
           </p>
           <Link className="btn btn-primary" to="/add">
             Add New
@@ -89,8 +158,8 @@ export function DashboardPage() {
             <p className="muted" style={{ marginTop: "1rem", marginBottom: 0 }}>
               You have {orphanPlaylists.length} playlist
               {orphanPlaylists.length === 1 ? "" : "s"} on{" "}
-              <Link to="/sources">Sources</Link>. Add the parent channel so they show as albums under
-              that artist.
+              <Link to="/sources">Sources</Link>. Add the parent channel so they show under that
+              series.
             </p>
           )}
         </div>
