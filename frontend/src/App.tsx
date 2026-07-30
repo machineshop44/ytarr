@@ -84,7 +84,9 @@ export default function App() {
       navigate("/add");
       return;
     }
-    navigate(`/add?q=${encodeURIComponent(q)}`);
+    // Artist - Title → open Add New as a video/song search
+    const kind = /\s[-–—:]\s/.test(q) ? "video" : "channel";
+    navigate(`/add?q=${encodeURIComponent(q)}&kind=${kind}`);
   };
 
   return (
@@ -218,7 +220,7 @@ export default function App() {
             <input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search"
+              placeholder="Search channel or Artist - Song"
               aria-label="Search YouTube to add"
             />
           </form>

@@ -232,6 +232,7 @@ export const api = {
       title?: string | null;
       yt_id?: string | null;
       thumbnail_url?: string | null;
+      channel?: string | null;
     },
   ) =>
     request<Source>("/api/sources", {
@@ -247,6 +248,7 @@ export const api = {
         ...(opts?.title ? { title: opts.title } : {}),
         ...(opts?.yt_id ? { yt_id: opts.yt_id } : {}),
         ...(opts?.thumbnail_url ? { thumbnail_url: opts.thumbnail_url } : {}),
+        ...(opts?.channel ? { channel: opts.channel } : {}),
       }),
     }),
   sourceDetailPath: (id: number) => `/channel/${id}`,

@@ -1,15 +1,17 @@
-"""Rename/organize downloaded files to a Plex-friendly naming scheme.
+"""Rename/organize downloaded files to Plex-friendly layouts.
 
-Recommended layout (Personal Media / Local Assets — date-based shows):
-
+Video (TV-style Personal Media):
   LibraryRoot/
     Channel Name/
       poster.jpg
-      fanart.jpg
       YYYY-MM-DD - Episode Title [youtubeId].ext
 
-Never invent 0000-00-00. If the upload date is unknown, omit the date prefix.
-Channel name lives in the folder — do not repeat it in the filename.
+Music (Plex Music artist folders + embedded MusicBrainz tags):
+  MusicRoot/
+    Artist Name/
+      Track Title.ext
+
+Never invent 0000-00-00. If the upload date is unknown for video, omit the date prefix.
 """
 from __future__ import annotations
 
@@ -74,6 +76,55 @@ def _date_prefix(video: Video, current: Path | None = None) -> str | None:
     return None
 
 
+def _is_audio(source: MonitoredSource | None) -> bool:
+    return bool(source) and (source.media_type or "video").strip().lower() == "audio"
+
+
+def _music_artist_folder(
+    source: MonitoredSource,
+    video: Video,
+    current: Path | None = None,
+) -> str:
+    """Plex Music artist folder — never use the track title as the artist."""
+    track = _safe_name(video.title or "", 200)
+    candidates: list[str] = []
+
+    folder = (source.folder_name or "").strip()
+    if folder:
+        candidates.append(folder)
+    if source.source_type == "channel" and (source.title or "").strip():
+        candidates.append(source.title.strip())
+    if current and current.parent.is_dir():
+        parent = current.parent.name.strip()
+        root_names = {
+            Path(get_config().music_library_root).name.lower(),
+            Path(get_config().library_root).name.lower(),
+            "music",
+            "library",
+        }
+        if parent and parent.lower() not in root_names:
+            candidates.append(parent)
+
+    for raw in candidates:
+        safe = _safe_name(raw)
+        if not safe:
+            continue
+        # Reject when folder was wrongly set to the song title (single-track adds)
+        if track and safe.lower() == track.lower():
+            continue
+        return safe
+    return "Unknown Artist"
+
+
+def music_artist_folder(
+    source: MonitoredSource,
+    video: Video,
+    current: Path | None = None,
+) -> str:
+    """Public helper: Plex Music artist folder name for a track."""
+    return _music_artist_folder(source, video, current)
+
+
 def desired_relative_path(
     source: MonitoredSource,
     video: Video,
@@ -81,19 +132,38 @@ def desired_relative_path(
     *,
     current: Path | None = None,
 ) -> Path:
-    folder = _safe_name(source.folder_name or source.title or "Unknown")
+    ext = ext.lstrip(".") or "mp4"
     title = _safe_name(video.title, 200)
+
+    if _is_audio(source):
+        # Plex Music: Artist / Title.ext — no YouTube [id] (Plex uses embedded tags / MB)
+        artist = _music_artist_folder(source, video, current)
+        filename = f"{title}.{ext}"
+        target = Path(artist) / filename
+        # Disambiguate collisions without agent-style [brackets]
+        if current is not None:
+            try:
+                library_root = _library_root_for(source)
+                full = library_root / target
+                if full.exists() and full.resolve() != current.resolve():
+                    filename = f"{title} ({video.video_id}).{ext}"
+                    target = Path(artist) / filename
+            except OSError:
+                pass
+        return target
+
+    folder = _safe_name(source.folder_name or source.title or "Unknown")
     date = _date_prefix(video, current)
     if date:
-        filename = f"{date} - {title} [{video.video_id}].{ext.lstrip('.')}"
+        filename = f"{date} - {title} [{video.video_id}].{ext}"
     else:
-        filename = f"{title} [{video.video_id}].{ext.lstrip('.')}"
+        filename = f"{title} [{video.video_id}].{ext}"
     return Path(folder) / filename
 
 
 def _library_root_for(source: MonitoredSource | None) -> Path:
     cfg = get_config()
-    if source and (source.media_type or "video") == "audio":
+    if _is_audio(source):
         return Path(cfg.music_library_root)
     return Path(cfg.library_root)
 
@@ -101,13 +171,13 @@ def _library_root_for(source: MonitoredSource | None) -> Path:
 def _find_file_by_id(library_root: Path, video_id: str) -> Path | None:
     if not library_root.exists():
         return None
-    needle = f"[{video_id}]"
+    needles = (f"[{video_id}]", f"({video_id})")
     for path in library_root.rglob("*"):
         if not path.is_file():
             continue
         if path.name in {"poster.jpg", "fanart.jpg"}:
             continue
-        if needle in path.name:
+        if any(n in path.name for n in needles):
             return path
     return None
 
@@ -135,11 +205,68 @@ def apply_path_mapping(path: str) -> str:
         host_n = host.replace("/", "\\")
         if normalized.lower().startswith(host_n.lower()):
             rest = normalized[len(host_n) :]
-            # Preserve plex path separators when plex looks POSIX
             if "/" in plex and "\\" not in plex:
                 return plex.rstrip("/") + rest.replace("\\", "/")
             return plex.rstrip("\\/") + rest
     return path
+
+
+def organize_downloaded_file(
+    db: Session,
+    video: Video,
+    source: MonitoredSource | None,
+    current: Path,
+) -> Path:
+    """Move a freshly downloaded file into the Plex layout. Updates video.file_path."""
+    if not source or not current.exists():
+        return current
+    library_root = _library_root_for(source)
+    rel = desired_relative_path(source, video, current.suffix, current=current)
+    target = library_root / rel
+    try:
+        if current.resolve() == target.resolve():
+            video.file_path = str(current)
+            # Heal music folder_name if it was the track title
+            if _is_audio(source):
+                artist = _music_artist_folder(source, video, current)
+                if (source.folder_name or "").strip().lower() != artist.lower():
+                    source.folder_name = artist
+                    db.add(source)
+            db.add(video)
+            return current
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() and target.resolve() != current.resolve():
+            # Keep existing correct file; drop the new duplicate download path
+            video.file_path = str(target)
+            db.add(video)
+            try:
+                current.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return target
+
+        shutil.move(str(current), str(target))
+        video.file_path = str(target)
+        db.add(video)
+
+        if _is_audio(source):
+            artist = target.parent.name
+            if artist and (source.folder_name or "").strip().lower() != artist.lower():
+                source.folder_name = artist
+                db.add(source)
+
+        try:
+            parent = current.parent
+            if parent.exists() and not any(parent.iterdir()):
+                parent.rmdir()
+        except OSError:
+            pass
+        return target
+    except OSError:
+        video.file_path = str(current)
+        db.add(video)
+        return current
 
 
 def preview_renames(db: Session, source_id: int | None = None) -> list[RenamePlan]:
@@ -158,7 +285,6 @@ def preview_renames(db: Session, source_id: int | None = None) -> list[RenamePla
         library_root = _library_root_for(source)
         current = _resolve_current(library_root, video)
         if not current:
-            # Also try the other root in case media_type was switched
             cfg = get_config()
             alt = Path(cfg.library_root)
             if alt != library_root:
@@ -228,23 +354,24 @@ def apply_renames(
             if not src.exists():
                 errors.append(f"{plan.youtube_id}: source missing")
                 continue
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            if dst.exists() and dst.resolve() != src.resolve():
-                errors.append(f"{plan.youtube_id}: target already exists")
-                continue
-            shutil.move(str(src), str(dst))
             video = db.get(Video, plan.video_db_id)
-            if video:
-                video.file_path = str(dst)
-                db.add(video)
-            renamed += 1
-
-            try:
-                parent = src.parent
-                if parent.exists() and not any(parent.iterdir()):
-                    parent.rmdir()
-            except OSError:
-                pass
+            source = video.source if video else None
+            if video and source:
+                organize_downloaded_file(db, video, source, src)
+                if video.file_path and Path(video.file_path).exists():
+                    renamed += 1
+                else:
+                    errors.append(f"{plan.youtube_id}: organize failed")
+            else:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if dst.exists() and dst.resolve() != src.resolve():
+                    errors.append(f"{plan.youtube_id}: target already exists")
+                    continue
+                shutil.move(str(src), str(dst))
+                if video:
+                    video.file_path = str(dst)
+                    db.add(video)
+                renamed += 1
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{plan.youtube_id}: {exc}")
 

@@ -886,7 +886,11 @@ export function ChannelDetailPage() {
             <p className="muted" style={{ margin: 0 }}>
               Organize files for this series ·{" "}
               {renameNeeds ? `${renameNeeds} need renaming` : "all match pattern"} ·{" "}
-              <span className="mono">YYYY-MM-DD - Title [id].ext</span>
+              <span className="mono">
+                {source.media_type === "audio"
+                  ? "Artist / Title.ext (MusicBrainz tags)"
+                  : "Channel / YYYY-MM-DD - Title [youtubeId].ext"}
+              </span>
             </p>
             <div className="row">
               <button

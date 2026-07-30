@@ -110,6 +110,7 @@ def add_source(
     title: str | None = None,
     yt_id: str | None = None,
     thumbnail_url: str | None = None,
+    channel: str | None = None,
 ) -> MonitoredSource:
     """Add a source.
 
@@ -146,12 +147,20 @@ def add_source(
 
     # Prefer search-hit metadata for a fast add (avoids a yt-dlp round-trip)
     hint_title = (title or "").strip()
-    if hint_title and url_kind in {"channel", "playlist"}:
+    hint_channel = (channel or "").strip()
+    if hint_title and url_kind in {"channel", "playlist", "video"}:
+        if url_kind == "video":
+            # Single track/video: folder = artist/channel (Plex Music / channel folder)
+            folder_base = hint_channel or (
+                "Unknown Artist" if media_type == "audio" else "YouTube Videos"
+            )
+        else:
+            folder_base = hint_title
         info = ytdlp.SourceInfo(
             title=hint_title,
             yt_id=(yt_id or "").strip() or None,
             source_type=url_kind,
-            folder_name=ytdlp._safe_folder_name(hint_title),
+            folder_name=ytdlp._safe_folder_name(folder_base),
             thumbnail_url=(thumbnail_url or "").strip() or None,
             banner_url=None,
             webpage_url=url,

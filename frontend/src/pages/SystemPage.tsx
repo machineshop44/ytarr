@@ -204,9 +204,9 @@ export function SystemPage({ section = "status" }: SystemPageProps) {
         </form>
 
         <div className="panel">
-          <h3 style={{ marginTop: 0 }}>Plex naming (per series → Rename)</h3>
+          <h3 style={{ marginTop: 0 }}>Plex naming</h3>
           <p className="muted" style={{ marginBottom: "0.5rem" }}>
-            Date-based Personal Media layout (recommended without third-party agents):
+            Video (Personal Media / Local Assets):
           </p>
           <pre className="mono" style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: "0.8rem" }}>
             {`LibraryRoot/
@@ -214,10 +214,21 @@ export function SystemPage({ section = "status" }: SystemPageProps) {
     poster.jpg
     YYYY-MM-DD - Episode Title [youtubeId].ext`}
           </pre>
+          <p className="muted" style={{ marginBottom: "0.5rem", marginTop: "0.75rem" }}>
+            Music (organized automatically on download):
+          </p>
+          <pre className="mono" style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: "0.8rem" }}>
+            {`MusicRoot/
+  Artist Name/
+    Track Title.ext`}
+          </pre>
           <p className="muted" style={{ marginBottom: 0, marginTop: "0.75rem" }}>
-            Missing upload dates no longer become <span className="mono">0000-00-00</span> — the date
-            is omitted (or taken from the existing filename / file time). Use Local Media Assets /
-            Personal Media Shows on a separate YouTube library.
+            Music files get MusicBrainz tags embedded when a match is found (Plex reads tags, not
+            bracket IDs in the name). YouTube ids stay in ytarr&apos;s database — and in a comment
+            tag — so they do not confuse Plex agents. Video still uses{" "}
+            <span className="mono">[youtubeId]</span> for uniqueness under Personal Media (that is
+            not a TVDB id). Missing upload dates no longer become{" "}
+            <span className="mono">0000-00-00</span>.
           </p>
         </div>
       </>

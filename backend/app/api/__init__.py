@@ -254,6 +254,7 @@ def create_source(body: SourceCreate, db: Session = Depends(get_db)) -> SourceOu
             title=body.title,
             yt_id=body.yt_id,
             thumbnail_url=body.thumbnail_url,
+            channel=body.channel,
         )
     except ytdlp.YtDlpError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

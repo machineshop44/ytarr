@@ -23,6 +23,8 @@ class SourceCreate(BaseModel):
     title: str | None = None
     yt_id: str | None = None
     thumbnail_url: str | None = None
+    # Uploader / artist name (used as music artist folder for single tracks)
+    channel: str | None = None
 
 
 class SearchHitOut(BaseModel):

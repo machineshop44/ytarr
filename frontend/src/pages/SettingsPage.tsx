@@ -150,9 +150,11 @@ export function SettingsPage({ section = "mediamanagement" }: SettingsPageProps)
                 Keep YouTube out of Sonarr and your main TV library.
               </p>
               <p className="muted" style={{ marginBottom: 0 }}>
-                Each series has a <strong>Rename</strong> tab for date-based files:{" "}
-                <span className="mono">Channel/YYYY-MM-DD - Title [id].ext</span>. Change the disk
-                under <strong>System → Root Folders</strong> if the library lives on another drive.
+                Video series use date-based files:{" "}
+                <span className="mono">Channel/YYYY-MM-DD - Title [youtubeId].ext</span>. Music uses{" "}
+                <span className="mono">Artist/Title.ext</span> with MusicBrainz tags embedded on
+                download (no YouTube id in the filename). Change the disk under{" "}
+                <strong>System → Root Folders</strong> if the library lives on another drive.
               </p>
             </div>
           </>

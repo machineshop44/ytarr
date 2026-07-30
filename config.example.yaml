@@ -20,7 +20,7 @@ default_quality: best
 format: bv*+ba/b
 # Plex Personal Media date-based: Channel/YYYY-MM-DD - Title [id].ext
 output_template: '%(uploader,playlist_title|Unknown)s/%(upload_date>%Y-%m-%d)s - %(title).200B [%(id)s].%(ext)s'
-music_output_template: '%(uploader,artist|Unknown)s/%(title).200B [%(id)s].%(ext)s'
+music_output_template: '%(uploader,artist|Unknown)s/%(title).200B.%(ext)s'
 poll_interval_minutes: 30
 concurrent_downloads: 1
 nocheck_certificates: false

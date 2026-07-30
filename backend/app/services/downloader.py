@@ -22,13 +22,13 @@ MIN_FREE_BYTES = 500 * 1024 * 1024
 
 def _find_downloaded_file(video_id: str) -> Path | None:
     cfg = get_config()
-    needle = f"[{video_id}]"
+    needles = (f"[{video_id}]", f"({video_id})")
     for root in (Path(cfg.library_root), Path(cfg.music_library_root)):
         if not root.exists():
             continue
         try:
             for path in root.rglob("*"):
-                if path.is_file() and needle in path.name:
+                if path.is_file() and any(n in path.name for n in needles):
                     return path
         except OSError:
             continue
@@ -349,8 +349,25 @@ def process_next_download() -> bool:
             job.progress = 100.0
             job.finished_at = datetime.utcnow()
             video.status = VideoStatus.DOWNLOADED.value
-            video.file_path = str(file_path) if file_path else video.file_path
             video.error = None
+            if file_path:
+                from . import musicbrainz, rename
+
+                organized = rename.organize_downloaded_file(
+                    db, video, source, Path(file_path)
+                )
+                video.file_path = str(organized)
+                if extract_audio and organized.exists():
+                    artist = rename.music_artist_folder(source, video, organized)
+                    try:
+                        musicbrainz.enrich_music_file(
+                            organized,
+                            title=video.title or organized.stem,
+                            artist=artist,
+                            youtube_id=video.video_id,
+                        )
+                    except Exception:
+                        pass
             db.add(job)
             db.add(video)
             db.commit()

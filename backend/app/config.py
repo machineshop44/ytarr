@@ -13,7 +13,7 @@ DEFAULT_OUTPUT_TEMPLATE = (
     "%(upload_date>%Y-%m-%d)s - %(title).200B [%(id)s].%(ext)s"
 )
 DEFAULT_MUSIC_OUTPUT_TEMPLATE = (
-    "%(uploader,artist|Unknown)s/%(title).200B [%(id)s].%(ext)s"
+    "%(uploader,artist|Unknown)s/%(title).200B.%(ext)s"
 )
 
 ROOT_DIR = Path(__file__).resolve().parents[2]

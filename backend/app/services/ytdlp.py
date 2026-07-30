@@ -448,6 +448,9 @@ def search_youtube(
     q = query.strip()
     if not q:
         return []
+    # Normalize common "Artist - Song" punctuation so ytsearch matches better
+    q = re.sub(r"\s*[–—]\s*", " - ", q)
+    q = re.sub(r"\s{2,}", " ", q).strip()
     kind = kind.strip().lower()
     if kind not in {"channel", "playlist", "video"}:
         raise YtDlpError("kind must be channel, playlist, or video")
@@ -471,6 +474,7 @@ def search_youtube(
         raise YtDlpError((result.stderr or result.stdout or "YouTube search failed").strip())
 
     hits: list[SearchHit] = []
+    seen_ids: set[str] = set()
     for line in (result.stdout or "").splitlines():
         line = line.strip()
         if not line:
@@ -511,6 +515,15 @@ def search_youtube(
         elif kind == "video":
             hit_kind = "video"
 
+        # Skip channel/playlist shells when the user asked for videos
+        if kind == "video" and hit_kind != "video":
+            continue
+
+        dedupe_key = str(item_id or url)
+        if dedupe_key in seen_ids:
+            continue
+        seen_ids.add(dedupe_key)
+
         video_count = None
         if hit_kind == "playlist":
             for field in ("playlist_count", "n_entries"):
@@ -519,6 +532,11 @@ def search_youtube(
                     video_count = raw
                     break
 
+        # Prefer maxres / hq thumb for videos when flat-playlist only has tiny ones
+        thumb = item.get("thumbnail") or _pick_best_thumbnail(item.get("thumbnails"))
+        if not thumb and hit_kind == "video" and item_id and len(str(item_id)) == 11:
+            thumb = f"https://i.ytimg.com/vi/{item_id}/hqdefault.jpg"
+
         hits.append(
             SearchHit(
                 kind=hit_kind,
@@ -526,7 +544,7 @@ def search_youtube(
                 url=str(url),
                 id=str(item_id) if item_id else None,
                 channel=str(channel) if channel else None,
-                thumbnail_url=item.get("thumbnail") or _pick_best_thumbnail(item.get("thumbnails")),
+                thumbnail_url=thumb,
                 duration=int(item["duration"]) if item.get("duration") else None,
                 description=(str(item.get("description"))[:240] if item.get("description") else None),
                 video_count=video_count,
