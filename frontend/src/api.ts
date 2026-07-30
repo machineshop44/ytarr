@@ -86,6 +86,26 @@ export type Settings = {
   sponsorblock_categories_video: string;
   sponsorblock_categories_music: string;
   path_mappings: PathMapping[];
+  api_key: string;
+  api_auth_required: boolean;
+  authentication_method: "none" | "forms";
+  username: string;
+  has_password: boolean;
+};
+
+export type AuthStatus = {
+  authentication_method: string;
+  forms_required: boolean;
+  authenticated: boolean;
+  username: string | null;
+};
+
+export type SystemStatus = {
+  appName: string;
+  instanceName: string;
+  version: string;
+  authentication: string;
+  api_auth_required: boolean;
 };
 
 export type SearchHit = {
@@ -169,11 +189,65 @@ export type Health = {
   library_exists: boolean;
 };
 
+declare global {
+  interface Window {
+    __YTARR__?: {
+      apiKey?: string;
+      apiAuthRequired?: boolean;
+      authenticationMethod?: string;
+      formsRequired?: boolean;
+      authenticated?: boolean;
+      username?: string;
+      port?: number;
+    };
+  }
+}
+
+function getApiKey(): string {
+  const fromWindow = window.__YTARR__?.apiKey?.trim();
+  if (fromWindow) {
+    try {
+      localStorage.setItem("ytarr_api_key", fromWindow);
+    } catch {
+      /* ignore */
+    }
+    return fromWindow;
+  }
+  try {
+    return localStorage.getItem("ytarr_api_key") || "";
+  } catch {
+    return "";
+  }
+}
+
+export function setApiKey(key: string) {
+  const trimmed = key.trim();
+  if (window.__YTARR__) window.__YTARR__.apiKey = trimmed;
+  else window.__YTARR__ = { apiKey: trimmed };
+  try {
+    localStorage.setItem("ytarr_api_key", trimmed);
+  } catch {
+    /* ignore */
+  }
+}
+
+export function clearApiKey() {
+  if (window.__YTARR__) window.__YTARR__.apiKey = "";
+  try {
+    localStorage.removeItem("ytarr_api_key");
+  } catch {
+    /* ignore */
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const key = getApiKey();
   const res = await fetch(path, {
     ...init,
+    credentials: "same-origin",
     headers: {
       "Content-Type": "application/json",
+      ...(key ? { "X-Api-Key": key } : {}),
       ...(init?.headers || {}),
     },
   });
@@ -194,9 +268,22 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   dashboard: () => request<Dashboard>("/api/dashboard"),
   health: () => request<Health>("/api/health"),
+  ping: () => request<{ ok: boolean; app: string }>("/api/ping"),
+  authStatus: () => request<AuthStatus>("/api/auth/status"),
+  login: (username: string, password: string) =>
+    request<{ ok: boolean; username: string; api_key: string }>("/api/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    }),
+  logout: () => request<{ ok: boolean }>("/api/logout", { method: "POST" }),
+  systemStatus: () => request<SystemStatus>("/api/system/status"),
   settings: () => request<Settings>("/api/settings"),
-  updateSettings: (body: Partial<Settings>) =>
-    request<Settings>("/api/settings", { method: "PUT", body: JSON.stringify(body) }),
+  updateSettings: (body: Partial<Settings> & { password?: string }) => {
+    const { api_key: _drop, has_password: _hp, ...rest } = body;
+    return request<Settings>("/api/settings", { method: "PUT", body: JSON.stringify(rest) });
+  },
+  regenerateApiKey: () =>
+    request<Settings>("/api/settings/regenerate-api-key", { method: "POST" }),
   sources: () => request<Source[]>("/api/sources"),
   search: (q: string, kind: "channel" | "playlist" | "video" = "channel", limit = 12) => {
     const params = new URLSearchParams({

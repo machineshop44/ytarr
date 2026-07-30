@@ -176,6 +176,12 @@ class SettingsOut(BaseModel):
         "music_offtopic,sponsor,selfpromo,interaction,intro,outro"
     )
     path_mappings: list[PathMappingOut] = []
+    api_key: str = ""
+    api_auth_required: bool = True
+    authentication_method: str = "forms"
+    username: str = ""
+    # password never returned — use has_password
+    has_password: bool = False
 
 
 class SettingsUpdate(BaseModel):
@@ -198,6 +204,52 @@ class SettingsUpdate(BaseModel):
     sponsorblock_categories_video: str | None = None
     sponsorblock_categories_music: str | None = None
     path_mappings: list[PathMappingOut] | None = None
+    # api_key is regenerated via POST /api/settings/regenerate-api-key only
+    api_auth_required: bool | None = None
+    authentication_method: str | None = Field(default=None, pattern="^(none|forms)$")
+    username: str | None = None
+    # Set a new password (plaintext once — stored hashed). Empty = leave unchanged.
+    password: str | None = None
+
+
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+
+class LoginOut(BaseModel):
+    ok: bool = True
+    username: str
+    api_key: str = ""
+
+
+class AuthStatusOut(BaseModel):
+    authentication_method: str
+    forms_required: bool
+    authenticated: bool
+    username: str | None = None
+
+
+class SystemStatusOut(BaseModel):
+    appName: str = "ytarr"
+    instanceName: str = "ytarr"
+    version: str = "0.1.0"
+    authentication: str = "forms"
+    api_auth_required: bool = True
+    urlBase: str = ""
+    branch: str = "main"
+    isDebug: bool = False
+    isProduction: bool = True
+    isAdmin: bool = True
+
+
+class HealthOut(BaseModel):
+    status: str
+    ytdlp_ok: bool
+    ytdlp_version: str | None
+    ytdlp_error: str | None = None
+    library_root: str
+    library_exists: bool
 
 
 class RenameItemOut(BaseModel):
@@ -239,12 +291,3 @@ class DashboardOut(BaseModel):
     queue_size: int
     ytdlp_ok: bool
     ytdlp_version: str | None
-
-
-class HealthOut(BaseModel):
-    status: str
-    ytdlp_ok: bool
-    ytdlp_version: str | None
-    ytdlp_error: str | None = None
-    library_root: str
-    library_exists: bool

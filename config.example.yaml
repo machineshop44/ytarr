@@ -1,5 +1,9 @@
 host: 127.0.0.1
 port: 8199
+# Use 0.0.0.0 to allow phones / Arrs hub on your LAN (restart after change).
+# api_key is auto-generated on first start — see Settings → General (or regenerate there).
+# api_key: ""
+api_auth_required: true
 # Relative paths are resolved from the ytarr app folder (portable).
 data_dir: data
 # Prefer absolute paths on the Plex machine when library is on another drive, e.g. E:\Media\YouTube

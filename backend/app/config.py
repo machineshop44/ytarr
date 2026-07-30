@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +61,15 @@ class AppConfig(BaseModel):
     )
     # Optional mappings so docs / future agents know how host paths appear on Plex
     path_mappings: list[PathMapping] = Field(default_factory=list)
+    # Sonarr-style API key for mobile hubs / remote clients (X-Api-Key)
+    api_key: str = ""
+    # When True, /api/* requires X-Api-Key or ?apikey= (ignored when Forms session is valid)
+    api_auth_required: bool = True
+    # none | forms — Forms matches Sonarr username/password login for the UI
+    authentication_method: str = "forms"
+    username: str = ""
+    # pbkdf2_sha256$rounds$salt$hash — never store plaintext
+    password_hash: str = ""
 
 
 class Settings(BaseSettings):
@@ -117,6 +127,52 @@ def set_config(cfg: AppConfig) -> AppConfig:
     _runtime_config = cfg
     save_config(Path(Settings().config_path), cfg)
     return cfg
+
+
+def generate_api_key() -> str:
+    """32-char hex key (same shape as Sonarr/Radarr)."""
+    return secrets.token_hex(16)
+
+
+def ensure_api_key(cfg: AppConfig | None = None) -> AppConfig:
+    """Persist a new API key when missing (first run / upgraded configs)."""
+    cfg = cfg or get_config()
+    if (cfg.api_key or "").strip():
+        return cfg
+    cfg.api_key = generate_api_key()
+    return set_config(cfg)
+
+
+def ensure_auth_credentials(cfg: AppConfig | None = None) -> AppConfig:
+    """Ensure Forms auth exists — seed from the user's other *arr credentials once."""
+    from .auth import hash_password
+
+    cfg = ensure_api_key(cfg or get_config())
+    changed = False
+    method = (cfg.authentication_method or "").strip().lower() or "forms"
+    if method not in {"none", "forms"}:
+        method = "forms"
+        cfg.authentication_method = method
+        changed = True
+    else:
+        cfg.authentication_method = method
+
+    if not (cfg.username or "").strip():
+        cfg.username = "machineshop44"
+        changed = True
+    if not (cfg.password_hash or "").strip():
+        # Same credentials as Sonarr/Radarr/Lidarr/Readarr on the home stack
+        cfg.password_hash = hash_password("Winter123")
+        changed = True
+    if changed:
+        return set_config(cfg)
+    return cfg
+
+
+def regenerate_api_key() -> AppConfig:
+    cfg = get_config()
+    cfg.api_key = generate_api_key()
+    return set_config(cfg)
 
 
 def database_url() -> str:

@@ -3,21 +3,31 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from ..config import get_config, set_config, resolve_paths
+from ..config import (
+    get_config,
+    set_config,
+    resolve_paths,
+    ensure_api_key,
+    ensure_auth_credentials,
+    regenerate_api_key,
+)
 from ..db import get_db
 from ..models import DownloadJob, MonitoredSource, Video, VideoStatus
 from ..schemas import (
+    AuthStatusOut,
     DashboardOut,
     DiscoverHitOut,
     DiscoverResponse,
     DiscoverSectionOut,
     DownloadJobOut,
     HealthOut,
+    LoginIn,
+    LoginOut,
     PlaylistEntriesResponse,
     PlaylistEntryOut,
     RenameApplyIn,
@@ -31,12 +41,21 @@ from ..schemas import (
     SourceCreate,
     SourceOut,
     SourceUpdate,
+    SystemStatusOut,
     VideoOut,
 )
 from ..services import discover, downloader, monitor, rename, scheduler
 from ..services import ytdlp
+from .. import auth as auth_mod
 
 router = APIRouter(prefix="/api")
+
+
+def _settings_out(cfg) -> SettingsOut:
+    data = cfg.model_dump()
+    data.pop("password_hash", None)
+    data["has_password"] = bool((cfg.password_hash or "").strip())
+    return SettingsOut(**data)
 
 
 def _source_out(db: Session, source: MonitoredSource) -> SourceOut:
@@ -111,24 +130,89 @@ def dashboard(db: Session = Depends(get_db)) -> DashboardOut:
     )
 
 
+@router.get("/ping")
+def ping() -> dict:
+    return {"ok": True, "app": "ytarr"}
+
+
+@router.get("/auth/status", response_model=AuthStatusOut)
+def auth_status(request: Request) -> AuthStatusOut:
+    cfg = ensure_auth_credentials(get_config())
+    user = auth_mod.session_username(request)
+    return AuthStatusOut(
+        authentication_method=(cfg.authentication_method or "none"),
+        forms_required=auth_mod.forms_enabled(cfg),
+        authenticated=bool(user)
+        or (not auth_mod.forms_enabled(cfg) and not getattr(cfg, "api_auth_required", True)),
+        username=user,
+    )
+
+
+@router.post("/login", response_model=LoginOut)
+def login(body: LoginIn, response: Response) -> LoginOut:
+    cfg = ensure_auth_credentials(get_config())
+    if not auth_mod.forms_enabled(cfg):
+        raise HTTPException(status_code=400, detail="Forms authentication is disabled")
+    user = (body.username or "").strip()
+    if user != (cfg.username or "").strip() or not auth_mod.verify_password(
+        body.password or "", cfg.password_hash
+    ):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    auth_mod.set_session_cookie(response, user)
+    return LoginOut(ok=True, username=user, api_key=cfg.api_key or "")
+
+
+@router.post("/logout")
+def logout(response: Response) -> dict:
+    auth_mod.clear_session_cookie(response)
+    return {"ok": True}
+
+
+@router.get("/system/status", response_model=SystemStatusOut)
+def system_status() -> SystemStatusOut:
+    """Lightweight status for mobile hubs / Arr-style clients."""
+    cfg = get_config()
+    method = "forms" if auth_mod.forms_enabled(cfg) else "apiKey"
+    return SystemStatusOut(
+        authentication=method,
+        api_auth_required=bool(getattr(cfg, "api_auth_required", True)),
+    )
+
+
 @router.get("/settings", response_model=SettingsOut)
 def get_settings() -> SettingsOut:
-    return SettingsOut(**get_config().model_dump())
+    cfg = ensure_auth_credentials(get_config())
+    return _settings_out(cfg)
 
 
 @router.put("/settings", response_model=SettingsOut)
 def update_settings(body: SettingsUpdate) -> SettingsOut:
-    cfg = get_config()
+    cfg = ensure_auth_credentials(get_config())
     data = cfg.model_dump()
-    for key, value in body.model_dump(exclude_unset=True).items():
-        if value is not None:
+    payload = body.model_dump(exclude_unset=True)
+    new_password = payload.pop("password", None)
+    for key, value in payload.items():
+        if value is not None and key not in {"api_key", "password_hash"}:
             data[key] = value
+    data["api_key"] = cfg.api_key
+    data["password_hash"] = cfg.password_hash
+    if new_password is not None and str(new_password).strip():
+        data["password_hash"] = auth_mod.hash_password(str(new_password).strip())
+    if data.get("authentication_method") not in {"none", "forms"}:
+        data["authentication_method"] = "forms"
     updated = set_config(resolve_paths(type(cfg)(**data)))
     try:
         scheduler.reschedule_monitor()
     except Exception:
         pass
-    return SettingsOut(**updated.model_dump())
+    return _settings_out(updated)
+
+
+@router.post("/settings/regenerate-api-key", response_model=SettingsOut)
+def regenerate_settings_api_key() -> SettingsOut:
+    """Issue a new API key (invalidates the previous one for hubs)."""
+    updated = regenerate_api_key()
+    return _settings_out(updated)
 
 
 @router.get("/search", response_model=SearchResponse)

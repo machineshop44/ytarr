@@ -1,5 +1,5 @@
 import { type ChangeEvent, type FormEvent, useEffect, useState } from "react";
-import { api, type Settings } from "../api";
+import { api, setApiKey, type Settings } from "../api";
 import { DEFAULT_QUALITY_OPTIONS } from "../qualityOptions";
 
 const empty: Settings = {
@@ -23,6 +23,11 @@ const empty: Settings = {
   sponsorblock_categories_music:
     "music_offtopic,sponsor,selfpromo,interaction,intro,outro",
   path_mappings: [],
+  api_key: "",
+  api_auth_required: true,
+  authentication_method: "forms",
+  username: "",
+  has_password: false,
 };
 
 export type SettingsSection = "mediamanagement" | "quality" | "downloadclients" | "general";
@@ -42,7 +47,7 @@ const SECTION_TITLES: Record<SettingsSection, { title: string; blurb: string }> 
   },
   general: {
     title: "General",
-    blurb: "Host, poll interval, and network options.",
+    blurb: "Host, API key for mobile hubs, poll interval, and network options.",
   },
 };
 
@@ -52,6 +57,7 @@ type SettingsPageProps = {
 
 export function SettingsPage({ section = "mediamanagement" }: SettingsPageProps) {
   const [form, setForm] = useState<Settings>(empty);
+  const [newPassword, setNewPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -60,18 +66,56 @@ export function SettingsPage({ section = "mediamanagement" }: SettingsPageProps)
   useEffect(() => {
     void api
       .settings()
-      .then(setForm)
+      .then((s) => {
+        setForm(s);
+        if (s.api_key) setApiKey(s.api_key);
+      })
       .catch((err) => setError(err instanceof Error ? err.message : String(err)));
   }, []);
 
+  const onRegenerateKey = async () => {
+    if (
+      !window.confirm(
+        "Generate a new API key? Mobile hubs using the old key will stop working until you update them.",
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const saved = await api.regenerateApiKey();
+      setForm(saved);
+      setApiKey(saved.api_key);
+      setMessage("New API key generated — update your mobile hub.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onCopyKey = async () => {
+    try {
+      await navigator.clipboard.writeText(form.api_key || "");
+      setMessage("API key copied.");
+    } catch {
+      setError("Could not copy — select the key and copy manually.");
+    }
+  };
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setBusy(true);
     setError(null);
     setMessage(null);
     try {
-      const saved = await api.updateSettings(form);
+      const payload: Partial<Settings> & { password?: string } = { ...form };
+      if (newPassword.trim()) payload.password = newPassword.trim();
+      const saved = await api.updateSettings(payload);
       setForm(saved);
+      setNewPassword("");
+      if (saved.api_key) setApiKey(saved.api_key);
       setMessage("Settings saved.");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -272,10 +316,108 @@ export function SettingsPage({ section = "mediamanagement" }: SettingsPageProps)
 
         {section === "general" && (
           <>
+            <div className="panel" style={{ margin: "0 0 1rem", background: "var(--bg)" }}>
+              <h3 style={{ marginTop: 0 }}>Security — Authentication</h3>
+              <p className="muted" style={{ marginTop: 0 }}>
+                Forms login for the web UI (like Sonarr). Mobile hubs still use the API key below.
+              </p>
+              <div className="field">
+                <label htmlFor="auth_method">Authentication</label>
+                <select
+                  id="auth_method"
+                  value={form.authentication_method}
+                  onChange={(e) =>
+                    setForm((prev) => ({
+                      ...prev,
+                      authentication_method: e.target.value as "none" | "forms",
+                    }))
+                  }
+                >
+                  <option value="forms">Forms (username / password)</option>
+                  <option value="none">None (API key only)</option>
+                </select>
+              </div>
+              <div className="field">
+                <label htmlFor="auth_user">Username</label>
+                <input
+                  id="auth_user"
+                  value={form.username}
+                  onChange={(e) => setForm((prev) => ({ ...prev, username: e.target.value }))}
+                  autoComplete="username"
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="auth_pass">
+                  Password {form.has_password ? "(leave blank to keep current)" : ""}
+                </label>
+                <input
+                  id="auth_pass"
+                  type="password"
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  autoComplete="new-password"
+                  placeholder={form.has_password ? "••••••••" : "Set a password"}
+                />
+              </div>
+            </div>
+
+            <div className="panel" style={{ margin: "0 0 1rem", background: "var(--bg)" }}>
+              <h3 style={{ marginTop: 0 }}>Security — API Key</h3>
+              <p className="muted" style={{ marginTop: 0 }}>
+                Same idea as Sonarr/Radarr. Paste this into your mobile Arrs hub with host{" "}
+                <span className="mono">http://&lt;this-pc-lan-ip&gt;:{form.port || 8199}</span> and
+                header <span className="mono">X-Api-Key</span>.
+              </p>
+              <div className="field">
+                <label htmlFor="api_key">API key</label>
+                <input
+                  id="api_key"
+                  className="mono"
+                  value={form.api_key}
+                  readOnly
+                  onFocus={(e) => e.target.select()}
+                />
+              </div>
+              <div className="row" style={{ gap: "0.5rem", marginBottom: "0.75rem" }}>
+                <button className="btn" type="button" disabled={busy || !form.api_key} onClick={() => void onCopyKey()}>
+                  Copy
+                </button>
+                <button
+                  className="btn"
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void onRegenerateKey()}
+                >
+                  Regenerate
+                </button>
+              </div>
+              <label className="mode-option" style={{ marginBottom: 0 }}>
+                <input
+                  type="checkbox"
+                  checked={form.api_auth_required}
+                  onChange={(e) =>
+                    setForm((prev) => ({ ...prev, api_auth_required: e.target.checked }))
+                  }
+                />
+                <span>
+                  <strong>Require API key for /api</strong>
+                  <small>
+                    Keep on when exposing ytarr on your LAN. Logged-in browsers use a session
+                    cookie; hubs use the API key.
+                  </small>
+                </span>
+              </label>
+            </div>
+
             <div className="row">
               <div className="field grow">
                 <label htmlFor="host">Bind address</label>
                 <input id="host" value={form.host} onChange={set("host")} />
+                <p className="muted" style={{ margin: "0.35rem 0 0", fontSize: "0.82rem" }}>
+                  Use <span className="mono">0.0.0.0</span> so phones on your Wi‑Fi can reach ytarr
+                  (then restart the tray app). <span className="mono">127.0.0.1</span> is
+                  this-PC-only.
+                </p>
               </div>
               <div className="field grow">
                 <label htmlFor="port">Port</label>

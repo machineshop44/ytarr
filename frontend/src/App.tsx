@@ -16,7 +16,8 @@ import { AddNewPage } from "./pages/AddNewPage";
 import { ChannelDetailPage } from "./pages/ChannelDetailPage";
 import { SystemPage } from "./pages/SystemPage";
 import { DiscoverPage } from "./pages/DiscoverPage";
-import { api, type Dashboard } from "./api";
+import { LoginPage } from "./pages/LoginPage";
+import { api, clearApiKey, type Dashboard } from "./api";
 import {
   BrandMark,
   IconActivity,
@@ -40,17 +41,49 @@ function childClass({ isActive }: { isActive: boolean }) {
 export default function App() {
   const [dash, setDash] = useState<Dashboard | null>(null);
   const [search, setSearch] = useState("");
+  const [authChecking, setAuthChecking] = useState(true);
+  const [needsLogin, setNeedsLogin] = useState(false);
+  const [authUser, setAuthUser] = useState<string | null>(null);
   const location = useLocation();
   const navigate = useNavigate();
 
   useEffect(() => {
     let alive = true;
+    void (async () => {
+      try {
+        const status = await api.authStatus();
+        if (!alive) return;
+        if (status.forms_required && !status.authenticated) {
+          setNeedsLogin(true);
+          setAuthUser(null);
+        } else {
+          setNeedsLogin(false);
+          setAuthUser(status.username);
+        }
+      } catch {
+        if (alive) setNeedsLogin(false);
+      } finally {
+        if (alive) setAuthChecking(false);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (needsLogin || authChecking) return;
+    let alive = true;
     const load = async () => {
       try {
         const d = await api.dashboard();
         if (alive) setDash(d);
-      } catch {
-        /* ignore */
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/unauthorized/i.test(msg)) {
+          setNeedsLogin(true);
+          setAuthUser(null);
+        }
       }
     };
     void load();
@@ -59,7 +92,7 @@ export default function App() {
       alive = false;
       window.clearInterval(id);
     };
-  }, []);
+  }, [needsLogin, authChecking]);
 
   const queueBadge = dash && dash.queue_size > 0 ? dash.queue_size : null;
   const wantedBadge = dash && dash.wanted > 0 ? dash.wanted : null;
@@ -84,10 +117,40 @@ export default function App() {
       navigate("/add");
       return;
     }
-    // Artist - Title → open Add New as a video/song search
     const kind = /\s[-–—:]\s/.test(q) ? "video" : "channel";
     navigate(`/add?q=${encodeURIComponent(q)}&kind=${kind}`);
   };
+
+  const onLogout = async () => {
+    try {
+      await api.logout();
+    } catch {
+      /* ignore */
+    }
+    clearApiKey();
+    setNeedsLogin(true);
+    setAuthUser(null);
+    setDash(null);
+  };
+
+  if (authChecking) {
+    return (
+      <div className="login-shell">
+        <p className="muted">Loading…</p>
+      </div>
+    );
+  }
+
+  if (needsLogin) {
+    return (
+      <LoginPage
+        onLoggedIn={(username) => {
+          setAuthUser(username);
+          setNeedsLogin(false);
+        }}
+      />
+    );
+  }
 
   return (
     <div className="app-shell">
@@ -212,6 +275,12 @@ export default function App() {
             </>
           )}
         </nav>
+        <div className="sidebar-footer">
+          {authUser && <div className="muted sidebar-user">{authUser}</div>}
+          <button className="btn btn-ghost" type="button" onClick={() => void onLogout()}>
+            Log out
+          </button>
+        </div>
       </aside>
 
       <div className="app-body">

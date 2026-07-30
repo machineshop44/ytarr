@@ -29,6 +29,11 @@ const emptySettings = (): Settings => ({
   sponsorblock_categories_music:
     "music_offtopic,sponsor,selfpromo,interaction,intro,outro",
   path_mappings: [],
+  api_key: "",
+  api_auth_required: true,
+  authentication_method: "forms",
+  username: "",
+  has_password: false,
 });
 
 export function SystemPage({ section = "status" }: SystemPageProps) {
