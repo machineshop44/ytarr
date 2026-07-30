@@ -135,8 +135,8 @@ export function BrandMark({ size = 36 }: { size?: number }) {
     >
       <defs>
         <linearGradient id="ytarrBrand" x1="8" y1="4" x2="42" y2="44">
-          <stop stopColor="#3fb950" />
-          <stop offset="1" stopColor="#238636" />
+          <stop stopColor="var(--accent-bright, var(--accent))" />
+          <stop offset="1" stopColor="var(--accent-dim)" />
         </linearGradient>
       </defs>
       <circle cx="24" cy="24" r="22" fill="url(#ytarrBrand)" />

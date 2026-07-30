@@ -1,6 +1,8 @@
 import { type ChangeEvent, type FormEvent, useEffect, useState } from "react";
 import { api, setApiKey, type Settings } from "../api";
 import { DEFAULT_QUALITY_OPTIONS } from "../qualityOptions";
+import { applyTheme, getStoredTheme, THEME_OPTIONS, type ThemeId } from "../theme";
+import { APP_VERSION } from "../version";
 
 const empty: Settings = {
   host: "127.0.0.1",
@@ -58,6 +60,7 @@ type SettingsPageProps = {
 export function SettingsPage({ section = "mediamanagement" }: SettingsPageProps) {
   const [form, setForm] = useState<Settings>(empty);
   const [newPassword, setNewPassword] = useState("");
+  const [theme, setTheme] = useState<ThemeId>(() => getStoredTheme());
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -317,6 +320,33 @@ export function SettingsPage({ section = "mediamanagement" }: SettingsPageProps)
         {section === "general" && (
           <>
             <div className="panel" style={{ margin: "0 0 1rem", background: "var(--bg)" }}>
+              <h3 style={{ marginTop: 0 }}>Appearance</h3>
+              <p className="muted" style={{ marginTop: 0 }}>
+                Forest matches Lidarr&apos;s green. YouTube uses a scarlet accent on a charcoal
+                shell — pick whichever fits the room.
+              </p>
+              <div className="theme-option-grid">
+                {THEME_OPTIONS.map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    className={`theme-option ${theme === opt.id ? "active" : ""}`}
+                    onClick={() => {
+                      setTheme(opt.id);
+                      applyTheme(opt.id);
+                    }}
+                  >
+                    <span className={`theme-swatch ${opt.id}`} aria-hidden />
+                    <span>
+                      <strong>{opt.label}</strong>
+                      <small>{opt.blurb}</small>
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="panel" style={{ margin: "0 0 1rem", background: "var(--bg)" }}>
               <h3 style={{ marginTop: 0 }}>Security — Authentication</h3>
               <p className="muted" style={{ marginTop: 0 }}>
                 Forms login for the web UI (like Sonarr). Mobile hubs still use the API key below.
@@ -456,6 +486,9 @@ export function SettingsPage({ section = "mediamanagement" }: SettingsPageProps)
           {busy ? "Saving…" : "Save changes"}
         </button>
       </form>
+      <p className="muted" style={{ marginTop: "1.25rem", fontSize: "0.82rem" }}>
+        ytarr v{APP_VERSION}
+      </p>
     </>
   );
 }

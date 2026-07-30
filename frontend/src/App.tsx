@@ -18,6 +18,7 @@ import { SystemPage } from "./pages/SystemPage";
 import { DiscoverPage } from "./pages/DiscoverPage";
 import { LoginPage } from "./pages/LoginPage";
 import { api, clearApiKey, type Dashboard } from "./api";
+import { applyTheme, getStoredTheme, type ThemeId } from "./theme";
 import {
   BrandMark,
   IconActivity,
@@ -44,8 +45,14 @@ export default function App() {
   const [authChecking, setAuthChecking] = useState(true);
   const [needsLogin, setNeedsLogin] = useState(false);
   const [authUser, setAuthUser] = useState<string | null>(null);
+  const [theme, setTheme] = useState<ThemeId>(() => getStoredTheme());
   const location = useLocation();
   const navigate = useNavigate();
+
+  const onThemeChange = (next: ThemeId) => {
+    setTheme(next);
+    applyTheme(next);
+  };
 
   useEffect(() => {
     let alive = true;
@@ -276,6 +283,24 @@ export default function App() {
           )}
         </nav>
         <div className="sidebar-footer">
+          <div className="theme-switch" role="group" aria-label="Color theme">
+            <button
+              type="button"
+              className={theme === "forest" ? "active" : undefined}
+              onClick={() => onThemeChange("forest")}
+              title="Forest green (Lidarr-like)"
+            >
+              Forest
+            </button>
+            <button
+              type="button"
+              className={theme === "youtube" ? "active" : undefined}
+              onClick={() => onThemeChange("youtube")}
+              title="YouTube red"
+            >
+              YouTube
+            </button>
+          </div>
           {authUser && <div className="muted sidebar-user">{authUser}</div>}
           <button className="btn btn-ghost" type="button" onClick={() => void onLogout()}>
             Log out
