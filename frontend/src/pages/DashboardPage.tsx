@@ -5,6 +5,7 @@ import { PosterCard } from "../components/PosterCard";
 
 type SortKey = "title" | "wanted" | "downloaded";
 type FilterKey = "all" | "monitored" | "unmonitored" | "wanted";
+type MediaFilter = "all" | "video" | "audio";
 
 export function DashboardPage() {
   const [sources, setSources] = useState<Source[]>([]);
@@ -13,6 +14,7 @@ export function DashboardPage() {
   const [busy, setBusy] = useState(false);
   const [sort, setSort] = useState<SortKey>("title");
   const [filter, setFilter] = useState<FilterKey>("all");
+  const [mediaFilter, setMediaFilter] = useState<MediaFilter>("all");
   const [query, setQuery] = useState("");
 
   const load = async () => {
@@ -37,10 +39,13 @@ export function DashboardPage() {
     };
   }, []);
 
-  const channels = useMemo(() => {
-    let list = sources.filter((s) => s.source_type === "channel");
+  /** Channels + one-off songs/videos + standalone playlists (everything in the library). */
+  const libraryItems = useMemo(() => {
+    let list = [...sources];
     const q = query.trim().toLowerCase();
     if (q) list = list.filter((s) => s.title.toLowerCase().includes(q));
+    if (mediaFilter === "video") list = list.filter((s) => (s.media_type || "video") !== "audio");
+    if (mediaFilter === "audio") list = list.filter((s) => s.media_type === "audio");
     if (filter === "monitored") list = list.filter((s) => s.enabled);
     if (filter === "unmonitored") list = list.filter((s) => !s.enabled);
     if (filter === "wanted") list = list.filter((s) => s.wanted_count > 0);
@@ -51,9 +56,7 @@ export function DashboardPage() {
       return a.title.localeCompare(b.title);
     });
     return list;
-  }, [sources, sort, filter, query]);
-
-  const orphanPlaylists = sources.filter((s) => s.source_type === "playlist");
+  }, [sources, sort, filter, mediaFilter, query]);
 
   const refreshAll = async () => {
     setBusy(true);
@@ -76,8 +79,8 @@ export function DashboardPage() {
     setError(null);
     setMessage(null);
     try {
-      const channelsOnly = sources.filter((s) => s.source_type === "channel");
-      for (const ch of channelsOnly) {
+      const withArt = sources.filter((s) => s.source_type === "channel" || s.source_type === "playlist");
+      for (const ch of withArt) {
         try {
           await api.refreshArtwork(ch.id);
         } catch {
@@ -85,7 +88,7 @@ export function DashboardPage() {
         }
       }
       await load();
-      setMessage(`Refreshed artwork for ${channelsOnly.length} channel(s).`);
+      setMessage(`Refreshed artwork for ${withArt.length} series.`);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -120,6 +123,16 @@ export function DashboardPage() {
         />
         <select
           className="toolbar-select"
+          value={mediaFilter}
+          onChange={(e) => setMediaFilter(e.target.value as MediaFilter)}
+          aria-label="Media type"
+        >
+          <option value="all">Media: All</option>
+          <option value="video">Video</option>
+          <option value="audio">Music</option>
+        </select>
+        <select
+          className="toolbar-select"
           value={sort}
           onChange={(e) => setSort(e.target.value as SortKey)}
           aria-label="Sort"
@@ -144,31 +157,23 @@ export function DashboardPage() {
       {error && <div className="error">{error}</div>}
       {message && <div className="success">{message}</div>}
 
-      {!channels.length && !error && (
+      {!libraryItems.length && !error && (
         <div className="panel empty-library">
-          <h2 style={{ marginTop: 0 }}>No channels yet</h2>
+          <h2 style={{ marginTop: 0 }}>Library is empty</h2>
           <p className="muted">
-            Add a <strong>channel</strong> (series). Pick seasons (playlists) and episodes (videos)
-            like Lidarr albums/tracks — members-only videos stay hidden.
+            Add a <strong>channel</strong>, playlist, or single song/video. Music one-offs and
+            channels both show up here.
           </p>
           <Link className="btn btn-primary" to="/add">
             Add New
           </Link>
-          {orphanPlaylists.length > 0 && (
-            <p className="muted" style={{ marginTop: "1rem", marginBottom: 0 }}>
-              You have {orphanPlaylists.length} playlist
-              {orphanPlaylists.length === 1 ? "" : "s"} on{" "}
-              <Link to="/sources">Sources</Link>. Add the parent channel so they show under that
-              series.
-            </p>
-          )}
         </div>
       )}
 
-      {channels.length > 0 && (
+      {libraryItems.length > 0 && (
         <section className="library-section">
           <div className="poster-grid">
-            {channels.map((source) => (
+            {libraryItems.map((source) => (
               <PosterCard key={source.id} source={source} />
             ))}
           </div>

@@ -16,6 +16,16 @@ export function PosterCard({ source }: PosterCardProps) {
     source.video_count > 0
       ? `${source.downloaded_count}/${source.video_count}`
       : `${source.downloaded_count} dl`;
+  const kindLabel =
+    source.media_type === "audio"
+      ? source.source_type === "video"
+        ? "Song"
+        : "Music"
+      : source.source_type === "video"
+        ? "Video"
+        : source.source_type === "playlist"
+          ? "Playlist"
+          : "Channel";
   const monitored =
     source.enabled && source.monitor_mode !== "none" && source.monitor_mode !== "video";
   const statusClass = !monitored
@@ -43,7 +53,7 @@ export function PosterCard({ source }: PosterCardProps) {
           {source.title}
         </div>
         <div className="poster-card-line">
-          {monitored ? "Monitored" : "Unmonitored"}
+          {kindLabel} · {monitored ? "Monitored" : "Downloaded"}
         </div>
         <div className="poster-card-line muted">
           <span>{qualityLabel(source.quality)}</span>
