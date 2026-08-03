@@ -25,14 +25,14 @@ DEFAULT_MUSIC_LIBRARY_DIR = ROOT_DIR / "music"
 
 
 class PathMapping(BaseModel):
-    """Sonarr-style remote path mapping: host path â†” path Plex (or another machine) sees."""
+    """Sonarr-style remote path mapping: host path Gåö path Plex (or another machine) sees."""
 
     host_path: str = ""
     plex_path: str = ""
 
 
 class AppConfig(BaseModel):
-    host: str = "127.0.0.1"
+    host: str = "0.0.0.0"  # LAN + port-forward; use 127.0.0.1 for localhost-only
     port: int = 8199
     data_dir: str = str(DEFAULT_DATA_DIR)
     library_root: str = str(DEFAULT_LIBRARY_DIR)
@@ -51,7 +51,7 @@ class AppConfig(BaseModel):
     # When True, worker will not start new downloads (Activity pause / disk-full)
     downloads_paused: bool = False
     # Prefer real HTTPS certificate verification. Only enable nocheck on broken
-    # networks (e.g. captive/guest Wiâ€‘Fi with SSL inspection). Use VPN when possible.
+    # networks (e.g. captive/guest WiGÇæFi with SSL inspection). Use VPN when possible.
     nocheck_certificates: bool = False
     # Cut SponsorBlock-marked segments via ffmpeg (community data; skips when unmarked)
     sponsorblock_remove: bool = True
@@ -65,10 +65,10 @@ class AppConfig(BaseModel):
     api_key: str = ""
     # When True, /api/* requires X-Api-Key or ?apikey= (ignored when Forms session is valid)
     api_auth_required: bool = True
-    # none | forms â€” Forms matches Sonarr username/password login for the UI
+    # none | forms GÇö Forms matches Sonarr username/password login for the UI
     authentication_method: str = "forms"
     username: str = ""
-    # pbkdf2_sha256$rounds$salt$hash â€” never store plaintext
+    # pbkdf2_sha256$rounds$salt$hash GÇö never store plaintext
     password_hash: str = ""
 
 
@@ -144,7 +144,7 @@ def ensure_api_key(cfg: AppConfig | None = None) -> AppConfig:
 
 
 def ensure_auth_credentials(cfg: AppConfig | None = None) -> AppConfig:
-    """Ensure Forms auth exists â€” seed from the user's other *arr credentials once."""
+    """Ensure Forms auth exists GÇö seed from the user's other *arr credentials once."""
     from .auth import hash_password
 
     cfg = ensure_api_key(cfg or get_config())

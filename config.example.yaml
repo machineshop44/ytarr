@@ -1,6 +1,6 @@
-host: 127.0.0.1
+host: 0.0.0.0
 port: 8199
-# Use 0.0.0.0 to allow phones / Arrs hub on your LAN (restart after change).
+# Default 0.0.0.0 = LAN + port-forward (Arrs Hub Mobile). Use 127.0.0.1 for localhost-only.
 # api_key is auto-generated on first start — see Settings → General (or regenerate there).
 # api_key: ""
 api_auth_required: true
@@ -20,8 +20,12 @@ ytdlp_path: yt-dlp
 ffmpeg_path: tools/ffmpeg/ffmpeg.exe
 # Named preset: best | 2160p | 1080p | 720p | 480p | worst | custom
 default_quality: best
+# Music bitrate: best | 320k | 192k | 128k | 64k | worst | custom
+default_music_quality: best
 # Used when default_quality (or a source's quality) is "custom"
 format: bv*+ba/b
+# Used when default_music_quality / music source quality is "custom"
+music_format: ba/b
 # Plex Personal Media date-based: Channel/YYYY-MM-DD - Title [id].ext
 output_template: '%(uploader,playlist_title|Unknown)s/%(upload_date>%Y-%m-%d)s - %(title).200B [%(id)s].%(ext)s'
 music_output_template: '%(uploader,artist|Unknown)s/%(title).200B.%(ext)s'
