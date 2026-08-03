@@ -163,7 +163,9 @@ class SettingsOut(BaseModel):
     ytdlp_path: str
     ffmpeg_path: str = ""
     default_quality: str = "best"
+    default_music_quality: str = "best"
     format: str
+    music_format: str = "ba/b"
     output_template: str
     music_output_template: str = ""
     poll_interval_minutes: int
@@ -182,6 +184,11 @@ class SettingsOut(BaseModel):
     username: str = ""
     # password never returned — use has_password
     has_password: bool = False
+    # Bind diagnostics (listen_* = socket opened at process start)
+    config_path: str = ""
+    listen_host: str | None = None
+    listen_port: int | None = None
+    restart_required: bool = False
 
 
 class SettingsUpdate(BaseModel):
@@ -190,7 +197,9 @@ class SettingsUpdate(BaseModel):
     ytdlp_path: str | None = None
     ffmpeg_path: str | None = None
     default_quality: str | None = None
+    default_music_quality: str | None = None
     format: str | None = None
+    music_format: str | None = None
     output_template: str | None = None
     music_output_template: str | None = None
     poll_interval_minutes: int | None = None
@@ -250,6 +259,11 @@ class HealthOut(BaseModel):
     ytdlp_error: str | None = None
     library_root: str
     library_exists: bool
+    config_path: str = ""
+    configured_host: str = ""
+    listen_host: str | None = None
+    listen_port: int | None = None
+    restart_required: bool = False
 
 
 class RenameItemOut(BaseModel):

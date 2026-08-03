@@ -8,6 +8,8 @@ import yaml
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
+from .paths import project_root
+
 
 DEFAULT_OUTPUT_TEMPLATE = (
     "%(uploader,playlist_title|Unknown)s/"
@@ -17,7 +19,7 @@ DEFAULT_MUSIC_OUTPUT_TEMPLATE = (
     "%(uploader,artist|Unknown)s/%(title).200B.%(ext)s"
 )
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
+ROOT_DIR = project_root()
 DEFAULT_CONFIG_PATH = ROOT_DIR / "config.yaml"
 DEFAULT_DATA_DIR = ROOT_DIR / "data"
 DEFAULT_LIBRARY_DIR = ROOT_DIR / "library"
@@ -25,14 +27,16 @@ DEFAULT_MUSIC_LIBRARY_DIR = ROOT_DIR / "music"
 
 
 class PathMapping(BaseModel):
-    """Sonarr-style remote path mapping: host path Gåö path Plex (or another machine) sees."""
+    """Sonarr-style remote path mapping: host path â†” path Plex (or another machine) sees."""
 
     host_path: str = ""
     plex_path: str = ""
 
 
 class AppConfig(BaseModel):
-    host: str = "0.0.0.0"  # LAN + port-forward; use 127.0.0.1 for localhost-only
+    # Default LAN/WAN-reachable so port-forward + Arrs Hub Mobile work.
+    # Opt into localhost-only with host: 127.0.0.1 in config.yaml.
+    host: str = "0.0.0.0"
     port: int = 8199
     data_dir: str = str(DEFAULT_DATA_DIR)
     library_root: str = str(DEFAULT_LIBRARY_DIR)
@@ -42,8 +46,12 @@ class AppConfig(BaseModel):
     ffmpeg_path: str = ""
     # Named preset: best | 2160p | 1080p | 720p | 480p | worst | custom
     default_quality: str = "best"
-    # Used when default_quality (or source quality) is "custom"
+    # Music: best | 320k | 192k | 128k | 64k | worst | custom
+    default_music_quality: str = "best"
+    # Used when default_quality (or source quality) is "custom" (video)
     format: str = "bv*+ba/b"
+    # Used when default_music_quality / music source quality is "custom"
+    music_format: str = "ba/b"
     output_template: str = DEFAULT_OUTPUT_TEMPLATE
     music_output_template: str = DEFAULT_MUSIC_OUTPUT_TEMPLATE
     poll_interval_minutes: int = 30
@@ -51,7 +59,7 @@ class AppConfig(BaseModel):
     # When True, worker will not start new downloads (Activity pause / disk-full)
     downloads_paused: bool = False
     # Prefer real HTTPS certificate verification. Only enable nocheck on broken
-    # networks (e.g. captive/guest WiGÇæFi with SSL inspection). Use VPN when possible.
+    # networks (e.g. captive/guest Wiâ€‘Fi with SSL inspection). Use VPN when possible.
     nocheck_certificates: bool = False
     # Cut SponsorBlock-marked segments via ffmpeg (community data; skips when unmarked)
     sponsorblock_remove: bool = True
@@ -65,10 +73,10 @@ class AppConfig(BaseModel):
     api_key: str = ""
     # When True, /api/* requires X-Api-Key or ?apikey= (ignored when Forms session is valid)
     api_auth_required: bool = True
-    # none | forms GÇö Forms matches Sonarr username/password login for the UI
+    # none | forms â€” Forms matches Sonarr username/password login for the UI
     authentication_method: str = "forms"
     username: str = ""
-    # pbkdf2_sha256$rounds$salt$hash GÇö never store plaintext
+    # pbkdf2_sha256$rounds$salt$hash â€” never store plaintext
     password_hash: str = ""
 
 
@@ -113,6 +121,41 @@ def save_config(path: Path, cfg: AppConfig) -> None:
 
 
 _runtime_config: AppConfig | None = None
+# Bind used when uvicorn started â€” Settings can change host/port on disk without
+# rebinding until the process fully quits and restarts.
+_listen_host: str | None = None
+_listen_port: int | None = None
+
+
+def config_file_path() -> Path:
+    """Absolute path to the config.yaml this process reads/writes."""
+    path = Path(Settings().config_path)
+    if not path.is_absolute():
+        path = ROOT_DIR / path
+    return path.resolve()
+
+
+def record_listen_bind(host: str, port: int) -> None:
+    """Call once when the HTTP server starts (not when Settings saves)."""
+    global _listen_host, _listen_port
+    _listen_host = (host or "").strip() or "0.0.0.0"
+    _listen_port = int(port)
+
+
+def get_listen_bind() -> tuple[str, int] | None:
+    if _listen_host is None or _listen_port is None:
+        return None
+    return _listen_host, _listen_port
+
+
+def restart_required_for_bind(cfg: AppConfig | None = None) -> bool:
+    """True when saved host/port differ from the socket this process opened."""
+    cfg = cfg or get_config()
+    bind = get_listen_bind()
+    if bind is None:
+        return False
+    listen_host, listen_port = bind
+    return (cfg.host or "").strip() != listen_host or int(cfg.port) != int(listen_port)
 
 
 def get_config() -> AppConfig:
@@ -125,7 +168,7 @@ def get_config() -> AppConfig:
 def set_config(cfg: AppConfig) -> AppConfig:
     global _runtime_config
     _runtime_config = cfg
-    save_config(Path(Settings().config_path), cfg)
+    save_config(config_file_path(), cfg)
     return cfg
 
 
@@ -144,7 +187,7 @@ def ensure_api_key(cfg: AppConfig | None = None) -> AppConfig:
 
 
 def ensure_auth_credentials(cfg: AppConfig | None = None) -> AppConfig:
-    """Ensure Forms auth exists GÇö seed from the user's other *arr credentials once."""
+    """Ensure Forms auth exists â€” seed from the user's other *arr credentials once."""
     from .auth import hash_password
 
     cfg = ensure_api_key(cfg or get_config())

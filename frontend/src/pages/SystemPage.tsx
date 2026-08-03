@@ -9,7 +9,7 @@ type SystemPageProps = {
 };
 
 const emptySettings = (): Settings => ({
-  host: "127.0.0.1",
+  host: "0.0.0.0",
   port: 8199,
   data_dir: "",
   library_root: "",
@@ -17,7 +17,9 @@ const emptySettings = (): Settings => ({
   ytdlp_path: "yt-dlp",
   ffmpeg_path: "",
   default_quality: "best",
+  default_music_quality: "best",
   format: "bv*+ba/b",
+  music_format: "ba/b",
   output_template: "",
   music_output_template: "",
   poll_interval_minutes: 30,

@@ -9,7 +9,10 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..config import (
+    config_file_path,
     get_config,
+    get_listen_bind,
+    restart_required_for_bind,
     set_config,
     resolve_paths,
     ensure_api_key,
@@ -55,6 +58,14 @@ def _settings_out(cfg) -> SettingsOut:
     data = cfg.model_dump()
     data.pop("password_hash", None)
     data["has_password"] = bool((cfg.password_hash or "").strip())
+    data["config_path"] = str(config_file_path())
+    bind = get_listen_bind()
+    if bind:
+        data["listen_host"], data["listen_port"] = bind
+    else:
+        data["listen_host"] = None
+        data["listen_port"] = None
+    data["restart_required"] = restart_required_for_bind(cfg)
     return SettingsOut(**data)
 
 
@@ -93,6 +104,7 @@ def _source_out(db: Session, source: MonitoredSource) -> SourceOut:
 def health() -> HealthOut:
     cfg = get_config()
     ok, version, err = ytdlp.get_version()
+    bind = get_listen_bind()
     return HealthOut(
         status="ok" if ok else "degraded",
         ytdlp_ok=ok,
@@ -100,6 +112,11 @@ def health() -> HealthOut:
         ytdlp_error=err,
         library_root=cfg.library_root,
         library_exists=Path(cfg.library_root).exists(),
+        config_path=str(config_file_path()),
+        configured_host=(cfg.host or "").strip(),
+        listen_host=bind[0] if bind else None,
+        listen_port=bind[1] if bind else None,
+        restart_required=restart_required_for_bind(cfg),
     )
 
 

@@ -75,7 +75,9 @@ export type Settings = {
   ytdlp_path: string;
   ffmpeg_path?: string;
   default_quality: string;
+  default_music_quality: string;
   format: string;
+  music_format: string;
   output_template: string;
   music_output_template: string;
   poll_interval_minutes: number;
@@ -91,6 +93,10 @@ export type Settings = {
   authentication_method: "none" | "forms";
   username: string;
   has_password: boolean;
+  config_path?: string;
+  listen_host?: string | null;
+  listen_port?: number | null;
+  restart_required?: boolean;
 };
 
 export type AuthStatus = {

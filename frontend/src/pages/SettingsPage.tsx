@@ -1,11 +1,11 @@
 import { type ChangeEvent, type FormEvent, useEffect, useState } from "react";
 import { api, setApiKey, type Settings } from "../api";
-import { DEFAULT_QUALITY_OPTIONS } from "../qualityOptions";
+import { DEFAULT_MUSIC_QUALITY_OPTIONS, DEFAULT_QUALITY_OPTIONS } from "../qualityOptions";
 import { applyTheme, getStoredTheme, THEME_OPTIONS, type ThemeId } from "../theme";
 import { APP_VERSION } from "../version";
 
 const empty: Settings = {
-  host: "127.0.0.1",
+  host: "0.0.0.0",
   port: 8199,
   data_dir: "",
   library_root: "",
@@ -13,7 +13,9 @@ const empty: Settings = {
   ytdlp_path: "yt-dlp",
   ffmpeg_path: "",
   default_quality: "best",
+  default_music_quality: "best",
   format: "bv*+ba/b",
+  music_format: "ba/b",
   output_template: "",
   music_output_template: "",
   poll_interval_minutes: 30,
@@ -41,7 +43,7 @@ const SECTION_TITLES: Record<SettingsSection, { title: string; blurb: string }> 
   },
   quality: {
     title: "Quality",
-    blurb: "Default resolution / format profile applied to new channels.",
+    blurb: "Default video resolution and music bitrate for new adds (overridable per source).",
   },
   downloadclients: {
     title: "Download Clients",
@@ -119,7 +121,25 @@ export function SettingsPage({ section = "mediamanagement" }: SettingsPageProps)
       setForm(saved);
       setNewPassword("");
       if (saved.api_key) setApiKey(saved.api_key);
-      setMessage("Settings saved.");
+      if (saved.restart_required) {
+        setMessage(
+          `Settings saved to ${saved.config_path || "config.yaml"}. ` +
+            `Bind change requires a FULL restart: tray → Quit (or kill the ytarr PID), then start ytarr again. ` +
+            `Until then netstat still shows the old listen address ` +
+            `(${saved.listen_host ?? "?"}:${saved.listen_port ?? "?"}), not ${saved.host}:${saved.port}.`,
+        );
+        window.alert(
+          "Bind address / port was saved, but ytarr must fully Quit and restart for LAN/WAN access.\n\n" +
+            "Tray icon → Quit (do not just close the browser tab), then launch ytarr again.\n\n" +
+            `After restart, netstat should show 0.0.0.0:${saved.port} (not 127.0.0.1).`,
+        );
+      } else {
+        setMessage(
+          saved.config_path
+            ? `Settings saved (${saved.config_path}).`
+            : "Settings saved.",
+        );
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -209,8 +229,9 @@ export function SettingsPage({ section = "mediamanagement" }: SettingsPageProps)
 
         {section === "quality" && (
           <>
+            <h3 style={{ marginTop: 0 }}>Video</h3>
             <div className="field">
-              <label htmlFor="default_quality">Default quality</label>
+              <label htmlFor="default_quality">Default video quality</label>
               <select
                 id="default_quality"
                 value={form.default_quality || "best"}
@@ -225,10 +246,44 @@ export function SettingsPage({ section = "mediamanagement" }: SettingsPageProps)
             </div>
             {(form.default_quality || "best") === "custom" && (
               <div className="field">
-                <label htmlFor="format">Custom format selector</label>
+                <label htmlFor="format">Custom video format selector</label>
                 <input id="format" value={form.format} onChange={set("format")} />
                 <p className="muted" style={{ margin: "0.35rem 0 0", fontSize: "0.82rem" }}>
-                  yt-dlp <span className="mono">-f</span> string when Default quality is Custom.
+                  yt-dlp <span className="mono">-f</span> string when Default video quality is Custom.
+                </p>
+              </div>
+            )}
+
+            <h3>Music</h3>
+            <div className="field">
+              <label htmlFor="default_music_quality">Default music quality</label>
+              <select
+                id="default_music_quality"
+                value={form.default_music_quality || "best"}
+                onChange={set("default_music_quality")}
+              >
+                {DEFAULT_MUSIC_QUALITY_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+              <p className="muted" style={{ margin: "0.35rem 0 0", fontSize: "0.82rem" }}>
+                Applied when Media type is Music and the source uses Default quality. Extracts to m4a
+                (needs ffmpeg).
+              </p>
+            </div>
+            {(form.default_music_quality || "best") === "custom" && (
+              <div className="field">
+                <label htmlFor="music_format">Custom music format selector</label>
+                <input
+                  id="music_format"
+                  value={form.music_format || "ba/b"}
+                  onChange={set("music_format")}
+                />
+                <p className="muted" style={{ margin: "0.35rem 0 0", fontSize: "0.82rem" }}>
+                  yt-dlp <span className="mono">-f</span> string for music (e.g.{" "}
+                  <span className="mono">ba/b</span>).
                 </p>
               </div>
             )}
@@ -444,10 +499,24 @@ export function SettingsPage({ section = "mediamanagement" }: SettingsPageProps)
                 <label htmlFor="host">Bind address</label>
                 <input id="host" value={form.host} onChange={set("host")} />
                 <p className="muted" style={{ margin: "0.35rem 0 0", fontSize: "0.82rem" }}>
-                  Use <span className="mono">0.0.0.0</span> so phones on your Wi‑Fi can reach ytarr
-                  (then restart the tray app). <span className="mono">127.0.0.1</span> is
-                  this-PC-only.
+                  Use <span className="mono">0.0.0.0</span> so phones / port-forward can reach ytarr.
+                  Changing bind does <strong>not</strong> hot-reload — tray → <strong>Quit</strong>, then
+                  start again. <span className="mono">127.0.0.1</span> is this-PC-only.
                 </p>
+                {form.config_path && (
+                  <p className="muted" style={{ margin: "0.35rem 0 0", fontSize: "0.78rem" }}>
+                    Config file: <span className="mono">{form.config_path}</span>
+                  </p>
+                )}
+                {form.listen_host != null && (
+                  <p className="muted" style={{ margin: "0.35rem 0 0", fontSize: "0.78rem" }}>
+                    Process listening now:{" "}
+                    <span className="mono">
+                      {form.listen_host}:{form.listen_port}
+                    </span>
+                    {form.restart_required ? " — RESTART REQUIRED for saved bind" : ""}
+                  </p>
+                )}
               </div>
               <div className="field grow">
                 <label htmlFor="port">Port</label>
