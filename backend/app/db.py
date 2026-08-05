@@ -50,6 +50,7 @@ def _ensure_sqlite_columns() -> None:
         "monitored_sources": {
             "quality": "VARCHAR(32) NOT NULL DEFAULT ''",
             "media_type": "VARCHAR(16) NOT NULL DEFAULT 'video'",
+            "parent_source_id": "INTEGER REFERENCES monitored_sources(id) ON DELETE SET NULL",
         },
     }
     with engine.begin() as conn:

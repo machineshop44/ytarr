@@ -15,7 +15,25 @@ Self-hosted Sonarr-style app for YouTube: monitor channels/playlists, download n
 
 HTTPS certificate verification is **on by default**. On Windows, ytarr uses the OS certificate store (so VPN roots like Surfshark work). Settings has an optional “Skip HTTPS certificate checks” toggle only as a last resort on broken guest Wi‑Fi.
 
-## Quick start
+## Windows installer (Arr-style)
+
+Build a single setup exe (same idea as Arrs Hub / Sonarr):
+
+```bat
+build-exe.bat
+```
+
+Or:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build-exe.ps1
+```
+
+Requires [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`winget install JRSoftware.InnoSetup`).
+
+Output: `release\ytarr-<version>-x64.exe`, and the build always updates `G:\My Drive\exe\` (use `-NoCopyToDrive` to skip). Run the installer → Start Menu / Desktop shortcut → system tray app on port 8199. User data (`config.yaml`, `data\`, libraries) stays under the install folder and is kept on upgrade/uninstall.
+
+## Quick start (dev / source)
 
 ### 1. Config
 
@@ -53,7 +71,7 @@ If ytarr is already running, Start just opens the UI again (won’t spawn duplic
 
 Look for the green play icon near the clock (Windows may hide it under the ^ overflow arrow).
 
-Port **8199** is ytarr’s default (avoids Readarr’s 8787 and other *arr ports). Change it in `config.yaml` / Settings if you want.
+Port **8199** is ytarr’s default (avoids Readarr’s 8787 and other *arr ports). The API binds **`0.0.0.0` by default** so LAN clients and a WAN port-forward (e.g. `67.x:8199` → Plex PC) can reach it — same idea as Arrs Hub. Opt into localhost-only with `host: 127.0.0.1` in `config.yaml` (restart after change).
 
 ### 3. Frontend (dev)
 

@@ -16,16 +16,12 @@ import {
   trackIsMonitored,
 } from "../components/AlbumMonitor";
 import { findExistingPlaylist } from "../components/playlistMatch";
-import { MEDIA_TYPE_OPTIONS, QUALITY_OPTIONS } from "../qualityOptions";
+import { MEDIA_TYPE_OPTIONS, coerceQualityForMedia, qualityLabel, qualityOptionsFor } from "../qualityOptions";
 
 type SeriesTab = "episodes" | "history" | "rename";
 
 async function kickQueue() {
-  try {
-    await api.processQueue();
-  } catch {
-    /* scheduler */
-  }
+  void api.processQueue().catch(() => undefined);
 }
 
 export function ChannelDetailPage() {
@@ -155,12 +151,12 @@ export function ChannelDetailPage() {
     void run();
     const timer = window.setInterval(() => {
       void loadCore().catch(() => undefined);
-    }, 8000);
+    }, source && !source.initialized ? 2000 : 8000);
     return () => {
       alive = false;
       window.clearInterval(timer);
     };
-  }, [loadCore]);
+  }, [loadCore, source?.initialized]);
 
   const loadHistory = useCallback(async (sourceIds: number[]) => {
     setHistoryLoading(true);
@@ -441,6 +437,8 @@ export function ChannelDetailPage() {
   };
 
   const togglePlaylistMonitor = async (hit: SearchHit, existing?: Source) => {
+    if (!source) return;
+    const channelId = source.id;
     setBusyKey(hit.url);
     setError(null);
     setMessage(null);
@@ -459,6 +457,12 @@ export function ChannelDetailPage() {
           return;
         }
         await api.patchSource(existing.id, { enabled: true, monitor_mode: "new" });
+        // Nest under this channel so it does not get a duplicate library poster
+        await api.addSource(hit.url, "new", {
+          parent_source_id: channelId,
+          title: hit.title,
+          yt_id: hit.id,
+        });
         await api.checkSource(existing.id);
         await kickQueue();
         setMessage(`Monitoring ${existing.title} — future uploads only.`);
@@ -473,8 +477,12 @@ export function ChannelDetailPage() {
           return;
         }
         const created = await api.addSource(hit.url, "all", {
-          quality: source?.quality || "",
-          media_type: (source?.media_type as "video" | "audio") || "video",
+          quality: source.quality || "",
+          media_type: (source.media_type as "video" | "audio") || "video",
+          title: hit.title,
+          yt_id: hit.id,
+          thumbnail_url: hit.thumbnail_url,
+          parent_source_id: channelId,
         });
         await kickQueue();
         setMessage(`Monitoring ${created.title} — downloading.`);
@@ -690,7 +698,9 @@ export function ChannelDetailPage() {
               <span className="info-label mono" title={source.folder_name}>
                 {source.folder_name}
               </span>
-              <span className="info-label">{source.quality || "Any"}</span>
+              <span className="info-label">
+                {qualityLabel(source.quality, source.media_type)}
+              </span>
               <span className="info-label">{uploadsMonitored ? "Monitored" : "Unmonitored"}</span>
               <span className="info-label">{source.media_type === "audio" ? "Music" : "Video"}</span>
               <span className="info-label">Monitor: {modeLabel}</span>
@@ -725,6 +735,15 @@ export function ChannelDetailPage() {
           </button>
         ))}
       </div>
+
+      {source && !source.initialized && (
+        <div className="panel" style={{ marginBottom: "0.75rem" }}>
+          <p className="muted" style={{ margin: 0 }}>
+            Importing catalog in the background… episodes will appear here shortly. Downloads
+            continue in Activity without blocking this page.
+          </p>
+        </div>
+      )}
 
       {tab === "episodes" &&
         (isChannel ? (
@@ -1015,13 +1034,15 @@ export function ChannelDetailPage() {
                 </select>
               </div>
               <div className="field">
-                <label htmlFor="edit-quality">Quality</label>
+                <label htmlFor="edit-quality">
+                  {editMediaType === "audio" ? "Music quality" : "Video quality"}
+                </label>
                 <select
                   id="edit-quality"
                   value={editQuality}
                   onChange={(e) => setEditQuality(e.target.value)}
                 >
-                  {QUALITY_OPTIONS.map((o) => (
+                  {qualityOptionsFor(editMediaType).map((o) => (
                     <option key={o.value || "default"} value={o.value}>
                       {o.label}
                     </option>
@@ -1033,7 +1054,11 @@ export function ChannelDetailPage() {
                 <select
                   id="edit-media"
                   value={editMediaType}
-                  onChange={(e) => setEditMediaType(e.target.value)}
+                  onChange={(e) => {
+                    const next = e.target.value;
+                    setEditMediaType(next);
+                    setEditQuality((q) => coerceQualityForMedia(q, next));
+                  }}
                 >
                   {MEDIA_TYPE_OPTIONS.map((o) => (
                     <option key={o.value} value={o.value}>
@@ -1093,6 +1118,11 @@ export function ChannelDetailPage() {
             <div className="modal-body">
               <p style={{ marginTop: 0 }}>
                 Remove <strong>{source.title}</strong> from the library?
+                {(source.nested_playlist_count ?? 0) > 0
+                  ? ` This also removes ${source.nested_playlist_count} nested playlist season${
+                      (source.nested_playlist_count ?? 0) === 1 ? "" : "s"
+                    }.`
+                  : ""}
               </p>
               <label className="mode-option" style={{ marginBottom: 0 }}>
                 <input
@@ -1103,7 +1133,8 @@ export function ChannelDetailPage() {
                 <span>
                   <strong>Delete files</strong>
                   <small>
-                    Also remove the channel folder and downloaded videos from disk (
+                    Also remove the channel folder, nested playlist folders, and downloaded
+                    videos from disk (
                     <span className="mono">{source.folder_name}</span>).
                   </small>
                 </span>

@@ -44,6 +44,7 @@ from ..schemas import (
     SourceCreate,
     SourceOut,
     SourceUpdate,
+    SystemLogsOut,
     SystemStatusOut,
     VideoOut,
 )
@@ -76,6 +77,15 @@ def _source_out(db: Session, source: MonitoredSource) -> SourceOut:
         .group_by(Video.status)
         .all()
     )
+    nested = 0
+    if source.source_type == "channel":
+        nested = (
+            db.query(func.count(MonitoredSource.id))
+            .filter(MonitoredSource.parent_source_id == source.id)
+            .filter(MonitoredSource.source_type == "playlist")
+            .scalar()
+            or 0
+        )
     return SourceOut(
         id=source.id,
         url=source.url,
@@ -89,6 +99,7 @@ def _source_out(db: Session, source: MonitoredSource) -> SourceOut:
         folder_name=source.folder_name,
         poster_path=source.poster_path,
         fanart_path=source.fanart_path,
+        parent_source_id=getattr(source, "parent_source_id", None),
         last_checked=source.last_checked,
         initialized=source.initialized,
         created_at=source.created_at,
@@ -97,6 +108,7 @@ def _source_out(db: Session, source: MonitoredSource) -> SourceOut:
         + counts.get(VideoStatus.QUEUED.value, 0)
         + counts.get(VideoStatus.DOWNLOADING.value, 0),
         downloaded_count=counts.get(VideoStatus.DOWNLOADED.value, 0),
+        nested_playlist_count=int(nested),
     )
 
 
@@ -188,12 +200,52 @@ def logout(response: Response) -> dict:
 @router.get("/system/status", response_model=SystemStatusOut)
 def system_status() -> SystemStatusOut:
     """Lightweight status for mobile hubs / Arr-style clients."""
+    from ..version import app_version
+
     cfg = get_config()
     method = "forms" if auth_mod.forms_enabled(cfg) else "apiKey"
     return SystemStatusOut(
+        version=app_version(),
         authentication=method,
         api_auth_required=bool(getattr(cfg, "api_auth_required", True)),
     )
+
+
+@router.get("/system/logs", response_model=SystemLogsOut)
+def system_logs(max_bytes: int = 256_000) -> SystemLogsOut:
+    """Tail of the application log for System → Log (copy/paste friendly)."""
+    from ..services import applog
+
+    path = applog.setup_app_logging()
+    text = applog.read_log_text(max_bytes=max(8_000, min(max_bytes, 1_000_000)))
+    return SystemLogsOut(path=str(path), text=text)
+
+
+@router.delete("/system/logs")
+def clear_system_logs() -> dict:
+    """Empty application / tray logs (Sonarr-style clear)."""
+    from ..services import applog
+
+    return applog.clear_logs()
+
+
+@router.post("/videos/clear-failed")
+def clear_failed_videos(db: Session = Depends(get_db)) -> dict:
+    """Mark all failed videos as ignored — clears the System nav badge."""
+    videos = db.query(Video).filter(Video.status == VideoStatus.FAILED.value).all()
+    n = 0
+    for video in videos:
+        video.status = VideoStatus.IGNORED.value
+        note = "Cleared from failed"
+        if video.error and note not in video.error:
+            video.error = f"{video.error} ({note})"
+        else:
+            video.error = note
+        db.add(video)
+        monitor.cancel_jobs_for_video(db, video, reason="Cleared from failed")
+        n += 1
+    db.commit()
+    return {"ok": True, "cleared": n}
 
 
 @router.get("/settings", response_model=SettingsOut)
@@ -338,6 +390,11 @@ def list_url_entries(url: str, limit: int = 100) -> PlaylistEntriesResponse:
 
 @router.get("/sources", response_model=list[SourceOut])
 def list_sources(db: Session = Depends(get_db)) -> list[SourceOut]:
+    # Collapse duplicate playlist posters under same-named channels (instant)
+    try:
+        monitor.link_orphan_playlists_fast(db)
+    except Exception:
+        db.rollback()
     sources = db.query(MonitoredSource).order_by(MonitoredSource.title.asc()).all()
     return [_source_out(db, s) for s in sources]
 
@@ -356,6 +413,7 @@ def create_source(body: SourceCreate, db: Session = Depends(get_db)) -> SourceOu
             yt_id=body.yt_id,
             thumbnail_url=body.thumbnail_url,
             channel=body.channel,
+            parent_source_id=body.parent_source_id,
         )
     except ytdlp.YtDlpError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -424,14 +482,8 @@ def delete_source(
     source = db.get(MonitoredSource, source_id)
     if not source:
         raise HTTPException(status_code=404, detail="Source not found")
-    files_result: dict = {"removed": [], "errors": []}
-    if delete_files:
-        # Load videos before cascade delete removes them
-        _ = list(source.videos)
-        files_result = monitor.delete_source_files(source)
-    db.delete(source)
-    db.commit()
-    return {"ok": True, "delete_files": delete_files, **files_result}
+    result = monitor.delete_source_tree(db, source, delete_files=delete_files)
+    return {"ok": True, "delete_files": delete_files, **result}
 
 
 @router.post("/sources/check-all")
@@ -477,9 +529,16 @@ def refresh_artwork(source_id: int, db: Session = Depends(get_db)) -> SourceOut:
 @router.get("/sources/{source_id}/poster")
 def source_poster(source_id: int, db: Session = Depends(get_db)):
     source = db.get(MonitoredSource, source_id)
-    if not source or not source.poster_path or not Path(source.poster_path).exists():
+    if not source:
         raise HTTPException(status_code=404, detail="Poster not found")
-    return FileResponse(source.poster_path)
+    candidates: list[Path] = []
+    if source.poster_path:
+        candidates.append(Path(source.poster_path))
+    candidates.append(monitor._library_root_for(source) / source.folder_name / "poster.jpg")
+    for path in candidates:
+        if path.is_file():
+            return FileResponse(path)
+    raise HTTPException(status_code=404, detail="Poster not found")
 
 
 @router.get("/sources/{source_id}/fanart")
@@ -598,8 +657,19 @@ def list_queue(
 
 @router.post("/queue/process")
 def process_queue() -> dict:
-    downloader.worker_tick()
-    return {"ok": True}
+    """Kick the download worker without blocking the HTTP request.
+
+    Downloads can take minutes; callers (Add New, etc.) must not wait on them.
+    The APScheduler tick also runs this work every ~15s.
+    """
+    import threading
+
+    threading.Thread(
+        target=downloader.worker_tick,
+        name="ytarr-queue-kick",
+        daemon=True,
+    ).start()
+    return {"ok": True, "started": True}
 
 
 @router.post("/queue/pause")

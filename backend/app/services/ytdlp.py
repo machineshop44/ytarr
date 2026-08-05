@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -107,16 +108,27 @@ def _ssl_env() -> dict[str, str]:
 def _ytdlp_cmd() -> list[str]:
     """Resolve how to invoke yt-dlp.
 
-    Default (empty / "yt-dlp" / "yt_dlp"): bundled pip module via
-    ``python -m yt_dlp``. On Windows we launch through ``ytdlp_launch.py``
-    so OS/VPN certificate roots (Surfshark, etc.) are trusted.
+    Default (empty / "yt-dlp" / "yt_dlp"): prefer a managed ``tools/yt-dlp``
+    binary (auto-updated), else the bundled pip module via ``-m yt_dlp``.
     Existing paths override for advanced setups.
     """
     cfg = get_config()
     configured = (cfg.ytdlp_path or "").strip()
 
-    # Bundled module — default for portable installs (no external exe required)
+    # Bundled / managed — default for portable installs
     if not configured or configured in {"yt-dlp", "yt_dlp"}:
+        try:
+            from .ytdlp_update import managed_ytdlp_path
+
+            managed = managed_ytdlp_path()
+            if managed.exists():
+                return [str(managed)]
+        except Exception:
+            pass
+        # Frozen: re-invoke this exe with -m yt_dlp (tray_app dispatches to yt-dlp).
+        # Never pass a .py launcher path — PyInstaller would start another tray instance.
+        if getattr(sys, "frozen", False):
+            return [sys.executable, "-m", "yt_dlp"]
         if sys.platform.startswith("win"):
             launcher = Path(__file__).resolve().parents[2] / "ytdlp_launch.py"
             if launcher.exists():
@@ -239,6 +251,15 @@ def _resolve_format(format_selector: str) -> tuple[str, bool]:
     return fmt, needs_merge
 
 
+def _subprocess_hide_kwargs() -> dict[str, Any]:
+    """Keep yt-dlp/ffmpeg from flashing console windows on Windows tray builds."""
+    if not sys.platform.startswith("win"):
+        return {}
+    # CREATE_NO_WINDOW (0x08000000) — no console for the child process
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    return {"creationflags": flags}
+
+
 def _common_prefix_args() -> list[str]:
     cfg = get_config()
     prefix: list[str] = []
@@ -266,6 +287,7 @@ def _run(
             encoding="utf-8",
             errors="replace",
             env=_ssl_env(),
+            **_subprocess_hide_kwargs(),
         )
     except FileNotFoundError as exc:
         raise YtDlpError(
@@ -277,16 +299,40 @@ def _run(
         raise YtDlpError(f"yt-dlp timed out: {' '.join(cmd)}") from exc
 
 
-def get_version() -> tuple[bool, str | None, str | None]:
+# UI polls /dashboard every few seconds — do not spawn yt-dlp each time.
+_VERSION_TTL_SEC = 600.0
+_version_cache: tuple[float, tuple[bool, str | None, str | None]] | None = None
+
+
+def invalidate_version_cache() -> None:
+    global _version_cache
+    _version_cache = None
+
+
+def get_version(*, force: bool = False) -> tuple[bool, str | None, str | None]:
+    global _version_cache
+    now = time.monotonic()
+    if (
+        not force
+        and _version_cache is not None
+        and now - _version_cache[0] < _VERSION_TTL_SEC
+    ):
+        return _version_cache[1]
     try:
         result = _run(["--version"], timeout=30)
     except YtDlpError as exc:
-        return False, None, str(exc)
+        out = (False, None, str(exc))
+        _version_cache = (now, out)
+        return out
     if result.returncode != 0:
         err = (result.stderr or result.stdout or "unknown error").strip()
-        return False, None, err
+        out = (False, None, err)
+        _version_cache = (now, out)
+        return out
     version = (result.stdout or "").strip().splitlines()[0] if result.stdout else None
-    return True, version, None
+    out = (True, version, None)
+    _version_cache = (now, out)
+    return out
 
 
 def _safe_folder_name(name: str) -> str:
@@ -323,6 +369,91 @@ def _pick_best_thumbnail(thumbnails: list[dict[str, Any]] | None) -> str | None:
     )
     return ranked[0]["url"] if ranked else None
 
+
+def _pick_channel_poster(thumbnails: list[dict[str, Any]] | None) -> str | None:
+    cands = _channel_poster_candidates(thumbnails)
+    return cands[0] if cands else None
+
+
+def _channel_poster_candidates(
+    thumbnails: list[dict[str, Any]] | None,
+    entries: list[dict[str, Any]] | None = None,
+) -> list[str]:
+    """Ordered avatar / square / video-thumb URLs to try for a channel poster."""
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def add(url: object) -> None:
+        u = str(url or "").strip()
+        if not u or u in seen:
+            return
+        seen.add(u)
+        urls.append(u)
+
+    usable = [t for t in (thumbnails or []) if t.get("url")]
+    # Prefer already-sized square avatars (more reliable than avatar_uncropped =s0)
+    squares = [
+        t
+        for t in usable
+        if int(t.get("width") or 0) > 0
+        and int(t.get("height") or 0) > 0
+        and 0.8 <= (int(t["width"]) / int(t["height"])) <= 1.25
+    ]
+    for t in sorted(
+        squares,
+        key=lambda x: int(x.get("width") or 0) * int(x.get("height") or 0),
+        reverse=True,
+    ):
+        add(t["url"])
+    for t in usable:
+        tid = str(t.get("id") or "").lower()
+        if tid == "avatar_uncropped" or "avatar" in tid:
+            add(t["url"])
+    for t in usable:
+        tid = str(t.get("id") or "").lower()
+        if "banner" in tid:
+            continue
+        add(t["url"])
+
+    for item in entries or []:
+        add(item.get("thumbnail") or _pick_best_thumbnail(item.get("thumbnails")))
+        vid = str(item.get("id") or "").strip()
+        if vid and not vid.startswith("http") and len(vid) >= 6:
+            add(f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg")
+            add(f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg")
+
+    return urls
+
+
+def _normalize_yt_image_url(url: str) -> str:
+    """yt3.googleusercontent.com bare / =s0 URLs often 400; request a concrete size."""
+    u = (url or "").strip()
+    if not u:
+        return u
+    host_ok = "googleusercontent.com" in u or "ytimg.com" in u
+    if not host_ok:
+        return u
+    if u.endswith("=s0"):
+        return u[:-3] + "=s900-c-k-c0x00ffffff-no-rj"
+    # Path segment with no size query (common for channel banners/avatars)
+    leaf = u.rsplit("/", 1)[-1]
+    if leaf and "=" not in leaf and "?" not in leaf:
+        return u + "=s900-c-k-c0x00ffffff-no-rj"
+    return u
+
+
+def _looks_like_image(data: bytes) -> bool:
+    if not data or len(data) < 64:
+        return False
+    if data[:3] == b"\xff\xd8\xff":
+        return True
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return True
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return True
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return True
+    return False
 
 def classify_url(url: str) -> str:
     """Return 'video', 'playlist', or 'channel' from a YouTube URL shape."""
@@ -389,6 +520,19 @@ def resolve_source(url: str) -> SourceInfo:
             str(info.get("channel") or info.get("uploader") or "YouTube Videos")
         )
         yt_id = info.get("id")
+        thumb = info.get("thumbnail") or _pick_best_thumbnail(info.get("thumbnails"))
+    elif source_type == "playlist":
+        # Keep playlist identity — do not collapse to the owning channel's id/title
+        title = (
+            info.get("playlist_title")
+            or info.get("title")
+            or info.get("channel")
+            or info.get("uploader")
+            or "Unknown"
+        )
+        yt_id = info.get("playlist_id") or info.get("id")
+        folder = _safe_folder_name(str(title))
+        thumb = info.get("thumbnail") or _pick_best_thumbnail(info.get("thumbnails"))
     else:
         title = (
             info.get("channel")
@@ -400,17 +544,18 @@ def resolve_source(url: str) -> SourceInfo:
         yt_id = (
             info.get("channel_id")
             or info.get("uploader_id")
-            or info.get("playlist_id")
             or info.get("id")
         )
         folder = _safe_folder_name(str(title))
+        # Prefer avatar over banner — banner URLs from yt-dlp often fail to download
+        thumb = _pick_channel_poster(info.get("thumbnails")) or info.get("thumbnail")
 
-    thumb = info.get("thumbnail") or _pick_best_thumbnail(info.get("thumbnails"))
     banner = None
     thumbnails = info.get("thumbnails") or []
     for t in thumbnails:
         url_t = t.get("url") or ""
-        if "banner" in url_t or (t.get("id") or "").lower().find("banner") >= 0:
+        tid = str(t.get("id") or "").lower()
+        if "banner" in url_t or "banner" in tid:
             banner = url_t
             break
 
@@ -419,8 +564,8 @@ def resolve_source(url: str) -> SourceInfo:
         yt_id=str(yt_id) if yt_id else None,
         source_type=source_type,
         folder_name=folder,
-        thumbnail_url=thumb,
-        banner_url=banner,
+        thumbnail_url=str(thumb) if thumb else None,
+        banner_url=str(banner) if banner else None,
         webpage_url=info.get("webpage_url") or url,
     )
 
@@ -881,6 +1026,7 @@ def download_image(url: str, dest: Path) -> Path | None:
         from urllib.request import Request, urlopen as _urlopen
 
         dest.parent.mkdir(parents=True, exist_ok=True)
+        url = _normalize_yt_image_url(url)
         cfg = get_config()
         if cfg.nocheck_certificates:
             ctx = ssl._create_unverified_context()
@@ -900,10 +1046,21 @@ def download_image(url: str, dest: Path) -> Path | None:
                     ctx = ssl.create_default_context(cafile=certifi.where())
                 except Exception:
                     pass
-        req = Request(url, headers={"User-Agent": "ytarr/0.1"})
+        req = Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                "Referer": "https://www.youtube.com/",
+            },
+        )
         with _urlopen(req, timeout=60, context=ctx) as resp:  # noqa: S310
             data = resp.read()
-        if not data:
+        if not _looks_like_image(data):
             return None
         dest.write_bytes(data)
         return dest
@@ -920,37 +1077,72 @@ def fetch_channel_artwork(
     folder.mkdir(parents=True, exist_ok=True)
     poster = folder / "poster.jpg"
     fanart = folder / "fanart.jpg"
-    poster_path = download_image(info.thumbnail_url, poster) if info.thumbnail_url else None
 
+    thumbs: list[dict[str, Any]] = []
+    entries: list[dict[str, Any]] = []
     banner_url = info.banner_url
-    if not banner_url:
-        # Try a fuller dump without flat playlist for better thumbs
+    rich: dict[str, Any] | None = None
+    try:
+        result = _run(
+            ["--dump-single-json", "--flat-playlist", "--playlist-end", "5", "--no-download", url],
+            timeout=120,
+        )
+        if result.returncode == 0 and result.stdout:
+            rich = json.loads(result.stdout)
+            thumbs = list(rich.get("thumbnails") or [])
+            entries = [e for e in (rich.get("entries") or []) if isinstance(e, dict)]
+            if not banner_url:
+                for t in thumbs:
+                    u = t.get("url") or ""
+                    tid = str(t.get("id") or "").lower()
+                    if "banner" in u or "banner" in tid:
+                        banner_url = u
+                        break
+    except Exception:
+        rich = None
+
+    candidates = _channel_poster_candidates(thumbs, entries)
+    if info.thumbnail_url:
+        # Keep resolve() pick early in the list without duplicating
+        candidates = [info.thumbnail_url] + [u for u in candidates if u != info.thumbnail_url]
+
+    poster_path = None
+    for cand in candidates:
+        poster_path = download_image(cand, poster)
+        if poster_path:
+            break
+
+    # Last-ditch: richer non-flat dump for avatar list
+    if not poster_path:
         try:
             result = _run(
                 ["--dump-single-json", "--playlist-items", "0", "--no-download", url],
                 timeout=120,
             )
             if result.returncode == 0 and result.stdout:
-                rich = json.loads(result.stdout)
-                thumbs = rich.get("thumbnails") or []
-                for t in thumbs:
-                    u = t.get("url") or ""
-                    if "maxresdefault" in u or "banner" in u:
-                        banner_url = u
+                rich2 = json.loads(result.stdout)
+                for cand in _channel_poster_candidates(rich2.get("thumbnails"), rich2.get("entries")):
+                    if cand in candidates:
+                        continue
+                    poster_path = download_image(cand, poster)
+                    if poster_path:
                         break
                 if not banner_url:
-                    banner_url = rich.get("thumbnail") or _pick_best_thumbnail(thumbs)
+                    for t in rich2.get("thumbnails") or []:
+                        u = t.get("url") or ""
+                        tid = str(t.get("id") or "").lower()
+                        if "banner" in u or "banner" in tid:
+                            banner_url = u
+                            break
         except Exception:
-            banner_url = None
+            pass
 
     fanart_path = None
-    if banner_url and banner_url != info.thumbnail_url:
-        fanart_path = download_image(banner_url, fanart)
-    elif info.thumbnail_url and not fanart.exists():
-        # Fall back: copy poster as fanart so Plex has something
-        if poster_path and poster_path.exists():
-            shutil.copy2(poster_path, fanart)
-            fanart_path = fanart
+    if banner_url:
+        fanart_path = download_image(str(banner_url), fanart)
+    if not fanart_path and poster_path and poster_path.exists() and not fanart.exists():
+        shutil.copy2(poster_path, fanart)
+        fanart_path = fanart
 
     return poster_path, fanart_path
 
@@ -996,6 +1188,7 @@ def download_video(
     format_selector: str,
     progress_cb: Callable[[float], None] | None = None,
     extract_audio: bool = False,
+    audio_quality: str = "0",
     sponsorblock_categories: str | None = None,
 ) -> Path | None:
     library_root.mkdir(parents=True, exist_ok=True)
@@ -1033,7 +1226,8 @@ def download_video(
     if sys.platform.startswith("win"):
         args[0:0] = ["--windows-filenames"]
     if extract_audio:
-        args.extend(["-x", "--audio-format", "m4a", "--audio-quality", "0"])
+        aq = (audio_quality or "0").strip() or "0"
+        args.extend(["-x", "--audio-format", "m4a", "--audio-quality", aq])
     elif needs_merge:
         args.extend(["--merge-output-format", "mkv"])
     if sb_cats:
@@ -1049,6 +1243,7 @@ def download_video(
             encoding="utf-8",
             errors="replace",
             env=_ssl_env(),
+            **_subprocess_hide_kwargs(),
         )
     except FileNotFoundError as exc:
         raise YtDlpError(f"yt-dlp not found ({' '.join(_ytdlp_cmd())})") from exc

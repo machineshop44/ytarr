@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings
 
 from .paths import project_root
@@ -24,6 +24,14 @@ DEFAULT_CONFIG_PATH = ROOT_DIR / "config.yaml"
 DEFAULT_DATA_DIR = ROOT_DIR / "data"
 DEFAULT_LIBRARY_DIR = ROOT_DIR / "library"
 DEFAULT_MUSIC_LIBRARY_DIR = ROOT_DIR / "music"
+
+
+def normalize_bind_host(host: str | None) -> str:
+    """Sanitize bind address — trailing dots (0.0.0.0.) break getaddrinfo on Windows."""
+    h = (host or "").strip()
+    while h.endswith("."):
+        h = h[:-1].rstrip()
+    return h or "127.0.0.1"
 
 
 class PathMapping(BaseModel):
@@ -79,6 +87,11 @@ class AppConfig(BaseModel):
     # pbkdf2_sha256$rounds$salt$hash — never store plaintext
     password_hash: str = ""
 
+    @field_validator("host", mode="before")
+    @classmethod
+    def _strip_trailing_dot_host(cls, v: Any) -> str:
+        return normalize_bind_host(v if isinstance(v, str) or v is None else str(v))
+
 
 class Settings(BaseSettings):
     config_path: str = str(DEFAULT_CONFIG_PATH)
@@ -93,12 +106,21 @@ class Settings(BaseSettings):
                 loaded = yaml.safe_load(f) or {}
                 if isinstance(loaded, dict):
                     data = loaded
-        cfg = AppConfig(**data)
-        return resolve_paths(cfg)
+        raw_host = data.get("host")
+        cfg = resolve_paths(AppConfig(**data))
+        # Auto-fix typos like 0.0.0.0. that break Windows getaddrinfo
+        if isinstance(raw_host, str) and normalize_bind_host(raw_host) != raw_host.strip():
+            try:
+                save_config(path, cfg)
+            except OSError:
+                pass
+        return cfg
 
 
 def resolve_paths(cfg: AppConfig) -> AppConfig:
     """Resolve relative paths against project root (portable installs)."""
+    cfg.host = normalize_bind_host(cfg.host)
+
     for field in ("data_dir", "library_root", "music_library_root", "ffmpeg_path", "ytdlp_path"):
         raw = (getattr(cfg, field) or "").strip()
         if not raw:
@@ -108,9 +130,20 @@ def resolve_paths(cfg: AppConfig) -> AppConfig:
         p = Path(raw)
         if not p.is_absolute():
             setattr(cfg, field, str((ROOT_DIR / p).resolve()))
-    Path(cfg.data_dir).mkdir(parents=True, exist_ok=True)
-    Path(cfg.library_root).mkdir(parents=True, exist_ok=True)
-    Path(cfg.music_library_root).mkdir(parents=True, exist_ok=True)
+
+    # data_dir must exist for logs/db — fail soft so a bad N:\ music/video root
+    # cannot prevent the tray app from starting at all.
+    try:
+        Path(cfg.data_dir).mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    for field in ("library_root", "music_library_root"):
+        try:
+            Path(getattr(cfg, field)).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # Drive missing / offline (e.g. N:\ not mapped yet) — continue; downloads
+            # will surface a clear error later.
+            pass
     return cfg
 
 
@@ -167,6 +200,7 @@ def get_config() -> AppConfig:
 
 def set_config(cfg: AppConfig) -> AppConfig:
     global _runtime_config
+    cfg = resolve_paths(cfg)
     _runtime_config = cfg
     save_config(config_file_path(), cfg)
     return cfg

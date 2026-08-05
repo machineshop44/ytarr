@@ -105,7 +105,7 @@ export default function App() {
   const wantedBadge = dash && dash.wanted > 0 ? dash.wanted : null;
   const systemBadge =
     dash && (!dash.ytdlp_ok || dash.failed > 0)
-      ? Math.max(1, (dash.ytdlp_ok ? 0 : 1) + (dash.failed > 0 ? 1 : 0))
+      ? (!dash.ytdlp_ok ? 1 : 0) + dash.failed
       : null;
 
   const path = location.pathname;
@@ -279,6 +279,9 @@ export default function App() {
               <NavLink to="/system/rootfolders" className={childClass}>
                 <span>Root Folders</span>
               </NavLink>
+              <NavLink to="/system/logs" className={childClass}>
+                <span>Log</span>
+              </NavLink>
             </>
           )}
         </nav>
@@ -346,6 +349,7 @@ export default function App() {
             <Route path="/settings/general" element={<SettingsPage section="general" />} />
             <Route path="/system" element={<SystemPage section="status" />} />
             <Route path="/system/rootfolders" element={<SystemPage section="rootfolders" />} />
+            <Route path="/system/logs" element={<SystemPage section="logs" />} />
           </Routes>
         </main>
       </div>

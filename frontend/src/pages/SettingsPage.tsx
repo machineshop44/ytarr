@@ -2,7 +2,6 @@ import { type ChangeEvent, type FormEvent, useEffect, useState } from "react";
 import { api, setApiKey, type Settings } from "../api";
 import { DEFAULT_MUSIC_QUALITY_OPTIONS, DEFAULT_QUALITY_OPTIONS } from "../qualityOptions";
 import { applyTheme, getStoredTheme, THEME_OPTIONS, type ThemeId } from "../theme";
-import { APP_VERSION } from "../version";
 
 const empty: Settings = {
   host: "0.0.0.0",
@@ -116,6 +115,9 @@ export function SettingsPage({ section = "mediamanagement" }: SettingsPageProps)
     setMessage(null);
     try {
       const payload: Partial<Settings> & { password?: string } = { ...form };
+      let host = String(payload.host ?? "").trim();
+      while (host.endsWith(".")) host = host.slice(0, -1).trimEnd();
+      payload.host = host || "127.0.0.1";
       if (newPassword.trim()) payload.password = newPassword.trim();
       const saved = await api.updateSettings(payload);
       setForm(saved);
@@ -497,7 +499,17 @@ export function SettingsPage({ section = "mediamanagement" }: SettingsPageProps)
             <div className="row">
               <div className="field grow">
                 <label htmlFor="host">Bind address</label>
-                <input id="host" value={form.host} onChange={set("host")} />
+                <input
+                  id="host"
+                  value={form.host}
+                  onChange={set("host")}
+                  onBlur={() => {
+                    let h = form.host.trim();
+                    while (h.endsWith(".")) h = h.slice(0, -1).trimEnd();
+                    const cleaned = h || "127.0.0.1";
+                    if (cleaned !== form.host) setForm((prev) => ({ ...prev, host: cleaned }));
+                  }}
+                />
                 <p className="muted" style={{ margin: "0.35rem 0 0", fontSize: "0.82rem" }}>
                   Use <span className="mono">0.0.0.0</span> so phones / port-forward can reach ytarr.
                   Changing bind does <strong>not</strong> hot-reload — tray → <strong>Quit</strong>, then
@@ -555,9 +567,6 @@ export function SettingsPage({ section = "mediamanagement" }: SettingsPageProps)
           {busy ? "Saving…" : "Save changes"}
         </button>
       </form>
-      <p className="muted" style={{ marginTop: "1.25rem", fontSize: "0.82rem" }}>
-        ytarr v{APP_VERSION}
-      </p>
     </>
   );
 }

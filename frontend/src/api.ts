@@ -11,12 +11,14 @@ export type Source = {
   folder_name: string;
   poster_path: string | null;
   fanart_path: string | null;
+  parent_source_id?: number | null;
   last_checked: string | null;
   initialized: boolean;
   created_at: string;
   video_count: number;
   wanted_count: number;
   downloaded_count: number;
+  nested_playlist_count?: number;
 };
 
 export type Video = {
@@ -283,6 +285,14 @@ export const api = {
     }),
   logout: () => request<{ ok: boolean }>("/api/logout", { method: "POST" }),
   systemStatus: () => request<SystemStatus>("/api/system/status"),
+  systemLogs: (maxBytes = 256000) =>
+    request<{ path: string; text: string }>(`/api/system/logs?max_bytes=${maxBytes}`),
+  clearSystemLogs: () =>
+    request<{ ok: boolean; cleared?: string[]; error?: string }>("/api/system/logs", {
+      method: "DELETE",
+    }),
+  clearFailedVideos: () =>
+    request<{ ok: boolean; cleared: number }>("/api/videos/clear-failed", { method: "POST" }),
   settings: () => request<Settings>("/api/settings"),
   updateSettings: (body: Partial<Settings> & { password?: string }) => {
     const { api_key: _drop, has_password: _hp, ...rest } = body;
@@ -326,6 +336,7 @@ export const api = {
       yt_id?: string | null;
       thumbnail_url?: string | null;
       channel?: string | null;
+      parent_source_id?: number | null;
     },
   ) =>
     request<Source>("/api/sources", {
@@ -342,6 +353,9 @@ export const api = {
         ...(opts?.yt_id ? { yt_id: opts.yt_id } : {}),
         ...(opts?.thumbnail_url ? { thumbnail_url: opts.thumbnail_url } : {}),
         ...(opts?.channel ? { channel: opts.channel } : {}),
+        ...(opts?.parent_source_id != null
+          ? { parent_source_id: opts.parent_source_id }
+          : {}),
       }),
     }),
   sourceDetailPath: (id: number) => `/channel/${id}`,
@@ -417,8 +431,21 @@ export const api = {
     request<DownloadJob>(`/api/queue/${id}/retry`, { method: "POST" }),
   cancelQueueJob: (id: number) =>
     request<DownloadJob>(`/api/queue/${id}/cancel`, { method: "POST" }),
-  posterUrl: (id: number) => `/api/sources/${id}/poster`,
-  fanartUrl: (id: number) => `/api/sources/${id}/fanart`,
+  posterUrl: (id: number, bust?: string | number) => {
+    const params = new URLSearchParams();
+    const key = getApiKey();
+    if (key) params.set("apikey", key);
+    if (bust != null && String(bust)) params.set("v", String(bust));
+    const q = params.toString();
+    return `/api/sources/${id}/poster${q ? `?${q}` : ""}`;
+  },
+  fanartUrl: (id: number) => {
+    const params = new URLSearchParams();
+    const key = getApiKey();
+    if (key) params.set("apikey", key);
+    const q = params.toString();
+    return `/api/sources/${id}/fanart${q ? `?${q}` : ""}`;
+  },
   renamePreview: (sourceId?: number) => {
     const q = new URLSearchParams();
     if (sourceId != null) q.set("source_id", String(sourceId));

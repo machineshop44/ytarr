@@ -36,6 +36,12 @@ class MonitoredSource(Base):
     folder_name: Mapped[str] = mapped_column(String(512), nullable=False, default="Unknown")
     poster_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     fanart_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # Playlist seasons nest under their channel in the library (Sonarr-style).
+    parent_source_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("monitored_sources.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     last_checked: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     initialized: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)

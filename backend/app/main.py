@@ -13,7 +13,10 @@ from .api import router as api_router
 from .auth import ApiKeyMiddleware
 from .config import ensure_auth_credentials, get_config
 from .db import init_db
+from .paths import project_root, resource_path
+from .services.applog import setup_app_logging
 from .services.scheduler import start_scheduler, stop_scheduler
+from .version import app_version
 
 
 @asynccontextmanager
@@ -28,12 +31,40 @@ async def lifespan(_app: FastAPI):
             truststore.inject_into_ssl()
     except Exception:
         pass
+    setup_app_logging()
     ensure_auth_credentials(get_config())
     init_db()
+    # Failed videos are already in the DB / Activity — don't re-spam the log on every boot.
     try:
         from .services import downloader
 
         downloader.recover_interrupted_downloads()
+    except Exception:
+        pass
+    # Collapse existing playlist posters under their channel (once, in background).
+    try:
+        import threading
+
+        from .db import SessionLocal
+        from .services import monitor
+
+        def _link_playlists() -> None:
+            s = SessionLocal()
+            try:
+                n = monitor.link_orphan_playlists(s)
+                if n:
+                    from .services import applog
+
+                    applog.log_info(
+                        f"Nested {n} playlist(s) under their channel in the library",
+                        source="startup",
+                    )
+            except Exception:
+                s.rollback()
+            finally:
+                s.close()
+
+        threading.Thread(target=_link_playlists, name="ytarr-link-playlists", daemon=True).start()
     except Exception:
         pass
     start_scheduler()
@@ -43,7 +74,7 @@ async def lifespan(_app: FastAPI):
         stop_scheduler()
 
 
-app = FastAPI(title="ytarr", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="ytarr", version=app_version(), lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -55,9 +86,9 @@ app.add_middleware(
 app.add_middleware(ApiKeyMiddleware)
 app.include_router(api_router)
 
-# backend/app/main.py -> parents[2] == project root
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
+# Writable install root (folder with ytarr.exe) / repo root in dev
+PROJECT_ROOT = project_root()
+FRONTEND_DIST = resource_path("frontend", "dist")
 
 
 def _inject_bootstrap(html: str, request: Request | None = None) -> str:

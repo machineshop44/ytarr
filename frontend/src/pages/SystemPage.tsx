@@ -1,8 +1,15 @@
 import { type FormEvent, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, type Dashboard, type Health, type PathMapping, type Settings } from "../api";
+import {
+  api,
+  type Dashboard,
+  type Health,
+  type PathMapping,
+  type Settings,
+  type SystemStatus,
+} from "../api";
 
-export type SystemSection = "status" | "rootfolders";
+export type SystemSection = "status" | "rootfolders" | "logs";
 
 type SystemPageProps = {
   section?: SystemSection;
@@ -42,22 +49,41 @@ export function SystemPage({ section = "status" }: SystemPageProps) {
   const [health, setHealth] = useState<Health | null>(null);
   const [dash, setDash] = useState<Dashboard | null>(null);
   const [settings, setSettings] = useState<Settings>(emptySettings());
+  const [sysStatus, setSysStatus] = useState<SystemStatus | null>(null);
+  const [logText, setLogText] = useState("");
+  const [logPath, setLogPath] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   const load = async () => {
-    const [h, d, s] = await Promise.all([api.health(), api.dashboard(), api.settings()]);
+    const [h, d, s, st] = await Promise.all([
+      api.health(),
+      api.dashboard(),
+      api.settings(),
+      api.systemStatus(),
+    ]);
     setHealth(h);
     setDash(d);
     setSettings({ ...emptySettings(), ...s, path_mappings: s.path_mappings || [] });
+    setSysStatus(st);
+  };
+
+  const loadLogs = async () => {
+    const logs = await api.systemLogs();
+    setLogText(logs.text);
+    setLogPath(logs.path);
   };
 
   useEffect(() => {
     let alive = true;
     const tick = async () => {
       try {
-        await load();
+        if (section === "logs") {
+          await loadLogs();
+        } else {
+          await load();
+        }
         if (alive) setError(null);
       } catch (err) {
         if (alive) setError(err instanceof Error ? err.message : String(err));
@@ -65,8 +91,8 @@ export function SystemPage({ section = "status" }: SystemPageProps) {
     };
     void tick();
     const id = window.setInterval(() => {
-      if (section === "status") void tick();
-    }, 8000);
+      if (section === "status" || section === "logs") void tick();
+    }, section === "logs" ? 5000 : 8000);
     return () => {
       alive = false;
       window.clearInterval(id);
@@ -121,6 +147,113 @@ export function SystemPage({ section = "status" }: SystemPageProps) {
       path_mappings: (prev.path_mappings || []).filter((_, i) => i !== index),
     }));
   };
+
+  if (section === "logs") {
+    return (
+      <>
+        <div className="page-header">
+          <div>
+            <h1>Log</h1>
+            <p>Application and tray events — copy and paste when reporting issues.</p>
+          </div>
+          <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+            <button
+              className="btn"
+              type="button"
+              disabled={busy}
+              onClick={() => {
+                void (async () => {
+                  setBusy(true);
+                  try {
+                    await loadLogs();
+                    setMessage(null);
+                  } catch (err) {
+                    setError(err instanceof Error ? err.message : String(err));
+                  } finally {
+                    setBusy(false);
+                  }
+                })();
+              }}
+            >
+              Refresh
+            </button>
+            <button
+              className="btn"
+              type="button"
+              disabled={busy}
+              onClick={() => {
+                if (
+                  !window.confirm(
+                    "Clear the application and tray logs?\n\nThis only empties the log files — it does not change failed downloads.",
+                  )
+                ) {
+                  return;
+                }
+                void (async () => {
+                  setBusy(true);
+                  setError(null);
+                  try {
+                    await api.clearSystemLogs();
+                    await loadLogs();
+                    setMessage("Logs cleared.");
+                  } catch (err) {
+                    setError(err instanceof Error ? err.message : String(err));
+                  } finally {
+                    setBusy(false);
+                  }
+                })();
+              }}
+            >
+              Clear log
+            </button>
+            <button
+              className="btn btn-primary"
+              type="button"
+              disabled={!logText}
+              onClick={() => {
+                void (async () => {
+                  try {
+                    await navigator.clipboard.writeText(logText);
+                    setMessage("Log copied to clipboard.");
+                  } catch {
+                    setError("Could not copy — select the log text and copy manually.");
+                  }
+                })();
+              }}
+            >
+              Copy log
+            </button>
+          </div>
+        </div>
+
+        {error && <div className="error">{error}</div>}
+        {message && <div className="success">{message}</div>}
+
+        {logPath && (
+          <p className="muted mono" style={{ marginBottom: "0.75rem" }}>
+            {logPath}
+          </p>
+        )}
+
+        <div className="panel">
+          <pre
+            className="mono"
+            style={{
+              margin: 0,
+              maxHeight: "min(70vh, 640px)",
+              overflow: "auto",
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+              fontSize: "0.8rem",
+              lineHeight: 1.45,
+            }}
+          >
+            {logText || "Loading…"}
+          </pre>
+        </div>
+      </>
+    );
+  }
 
   if (section === "rootfolders") {
     return (
@@ -268,6 +401,59 @@ export function SystemPage({ section = "status" }: SystemPageProps) {
           </ul>
         </div>
       )}
+
+      {(dash?.failed ?? 0) > 0 && (
+        <div className="panel" style={{ borderColor: "var(--danger, #c44)" }}>
+          <h3 style={{ marginTop: 0 }}>Failed downloads</h3>
+          <p className="muted">
+            {dash?.failed} video{dash?.failed === 1 ? "" : "s"} failed (private, 403, etc.). This
+            drives the red badge on System. Clear them to ignore permanently, or retry from Activity /
+            Wanted.
+          </p>
+          <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+            <Link className="btn" to="/wanted?status=failed">
+              View failed
+            </Link>
+            <button
+              className="btn btn-danger"
+              type="button"
+              disabled={busy}
+              onClick={() => {
+                if (
+                  !window.confirm(
+                    `Clear ${dash?.failed} failed video${dash?.failed === 1 ? "" : "s"}?\n\n` +
+                      `They will be marked ignored and will not retry. The System badge will clear.`,
+                  )
+                ) {
+                  return;
+                }
+                void (async () => {
+                  setBusy(true);
+                  setError(null);
+                  try {
+                    const result = await api.clearFailedVideos();
+                    await load();
+                    setMessage(`Cleared ${result.cleared} failed video(s).`);
+                  } catch (err) {
+                    setError(err instanceof Error ? err.message : String(err));
+                  } finally {
+                    setBusy(false);
+                  }
+                })();
+              }}
+            >
+              Clear failed
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="panel">
+        <h3 style={{ marginTop: 0 }}>ytarr</h3>
+        <p className="mono" style={{ marginBottom: 0 }}>
+          Version {sysStatus?.version || "—"}
+        </p>
+      </div>
 
       <div className="stats">
         <div className="stat">

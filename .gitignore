@@ -1,5 +1,7 @@
 node_modules/
 dist/
+build/
+release/
 .DS_Store
 *.local
 .env
@@ -23,6 +25,8 @@ config.yaml
 
 # Large bundled binaries — run scripts/fetch-ffmpeg.ps1 (kept out of git)
 tools/ffmpeg/**
+tools/yt-dlp
+tools/yt-dlp.exe
 !tools/ffmpeg/.gitkeep
 !tools/README.md
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class SourceCreate(BaseModel):
@@ -25,6 +25,8 @@ class SourceCreate(BaseModel):
     thumbnail_url: str | None = None
     # Uploader / artist name (used as music artist folder for single tracks)
     channel: str | None = None
+    # Nest playlist under a channel so it does not get its own library poster
+    parent_source_id: int | None = None
 
 
 class SearchHitOut(BaseModel):
@@ -106,12 +108,15 @@ class SourceOut(BaseModel):
     folder_name: str
     poster_path: str | None
     fanart_path: str | None
+    parent_source_id: int | None = None
     last_checked: datetime | None
     initialized: bool
     created_at: datetime
     video_count: int = 0
     wanted_count: int = 0
     downloaded_count: int = 0
+    # Playlist seasons nested under this channel (library collapse)
+    nested_playlist_count: int = 0
 
     model_config = {"from_attributes": True}
 
@@ -220,6 +225,15 @@ class SettingsUpdate(BaseModel):
     # Set a new password (plaintext once — stored hashed). Empty = leave unchanged.
     password: str | None = None
 
+    @field_validator("host", mode="before")
+    @classmethod
+    def _normalize_host(cls, v: object) -> object:
+        if v is None:
+            return v
+        from .config import normalize_bind_host
+
+        return normalize_bind_host(v if isinstance(v, str) else str(v))
+
 
 class LoginIn(BaseModel):
     username: str
@@ -242,7 +256,7 @@ class AuthStatusOut(BaseModel):
 class SystemStatusOut(BaseModel):
     appName: str = "ytarr"
     instanceName: str = "ytarr"
-    version: str = "0.1.0"
+    version: str = "0.0.0"
     authentication: str = "forms"
     api_auth_required: bool = True
     urlBase: str = ""
@@ -250,6 +264,11 @@ class SystemStatusOut(BaseModel):
     isDebug: bool = False
     isProduction: bool = True
     isAdmin: bool = True
+
+
+class SystemLogsOut(BaseModel):
+    path: str
+    text: str
 
 
 class HealthOut(BaseModel):

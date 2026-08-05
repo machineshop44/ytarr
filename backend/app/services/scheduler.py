@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from ..config import get_config
 from ..db import SessionLocal
-from . import downloader, monitor
+from . import downloader, monitor, ytdlp_update
 
 _scheduler: BackgroundScheduler | None = None
 
@@ -19,6 +21,15 @@ def _monitor_job() -> None:
 
 def _download_job() -> None:
     downloader.worker_tick()
+
+
+def _ytdlp_update_job() -> None:
+    """Refresh yt-dlp and check/refresh ffmpeg on the same schedule."""
+    try:
+        ytdlp_update.maybe_update_ytdlp()
+    except Exception:
+        # Never let updater crashes take down the scheduler
+        pass
 
 
 def start_scheduler() -> BackgroundScheduler:
@@ -45,6 +56,18 @@ def start_scheduler() -> BackgroundScheduler:
         replace_existing=True,
         max_instances=1,
         coalesce=True,
+    )
+    # First tools check ~30s after start (let UI bind), then every 24h.
+    # Updates yt-dlp and verifies/refreshes ffmpeg in the same pass.
+    scheduler.add_job(
+        _ytdlp_update_job,
+        "interval",
+        hours=24,
+        id="ytdlp_update",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=30),
     )
     scheduler.start()
     _scheduler = scheduler

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { api, type Video } from "../api";
 
 type LibraryPageProps = {
@@ -7,8 +7,10 @@ type LibraryPageProps = {
 };
 
 export function LibraryPage({ defaultStatus = "wanted" }: LibraryPageProps) {
+  const [searchParams] = useSearchParams();
+  const statusFromQuery = searchParams.get("status");
   const [videos, setVideos] = useState<Video[]>([]);
-  const [status, setStatus] = useState(defaultStatus);
+  const [status, setStatus] = useState(statusFromQuery || defaultStatus);
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
   const [busyAll, setBusyAll] = useState(false);
@@ -18,8 +20,8 @@ export function LibraryPage({ defaultStatus = "wanted" }: LibraryPageProps) {
   };
 
   useEffect(() => {
-    setStatus(defaultStatus);
-  }, [defaultStatus]);
+    setStatus(statusFromQuery || defaultStatus);
+  }, [defaultStatus, statusFromQuery]);
 
   useEffect(() => {
     void load().catch((err) => setError(err instanceof Error ? err.message : String(err)));

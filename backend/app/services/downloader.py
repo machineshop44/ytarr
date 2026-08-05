@@ -295,11 +295,20 @@ def process_next_download() -> bool:
 
         job_id = job.id
         video_id = video.video_id
+        music_default = getattr(cfg, "default_music_quality", None) or "best"
+        music_fmt = getattr(cfg, "music_format", None) or "ba/b"
+        src_quality = source.quality if source else ""
         fmt = quality.resolve_format_selector(
-            source.quality if source else "",
+            src_quality,
             default_quality=cfg.default_quality,
-            custom_format=cfg.format,
+            custom_format=music_fmt if extract_audio else cfg.format,
             media_type=media_type,
+            default_music_quality=music_default,
+        )
+        audio_q = (
+            quality.resolve_audio_ffmpeg_quality(src_quality, default_quality=music_default)
+            if extract_audio
+            else "0"
         )
 
         def on_progress(pct: float) -> None:
@@ -327,6 +336,7 @@ def process_next_download() -> bool:
             format_selector=fmt,
             progress_cb=on_progress,
             extract_audio=extract_audio,
+            audio_quality=audio_q,
             sponsorblock_categories=sb_cats,
         )
 
@@ -389,9 +399,36 @@ def process_next_download() -> bool:
         if video is not None:
             video = db.get(Video, video.id) or video
             if video.status != VideoStatus.IGNORED.value:
-                video.status = VideoStatus.FAILED.value
+                err_l = str(exc).lower()
+                # Permanent access issues — don't keep retrying as "failed"
+                if any(
+                    s in err_l
+                    for s in (
+                        "private video",
+                        "video unavailable",
+                        "has been removed",
+                        "account associated with this video has been terminated",
+                        "login required",
+                        "sign in if you've been granted access",
+                    )
+                ):
+                    video.status = VideoStatus.IGNORED.value
+                else:
+                    video.status = VideoStatus.FAILED.value
                 video.error = str(exc)
                 db.add(video)
+        try:
+            from . import applog
+
+            title = (video.title if video else None) or (video.video_id if video else "?")
+            vid = video.video_id if video else "?"
+            status = video.status if video else "failed"
+            applog.log_error(
+                f"Download {status} [{vid}] {title}: {exc}",
+                source="downloader",
+            )
+        except Exception:
+            pass
         db.commit()
         return True
     finally:

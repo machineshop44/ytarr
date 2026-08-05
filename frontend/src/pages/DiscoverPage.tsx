@@ -5,11 +5,7 @@ import { ChannelAddModal } from "../components/ChannelAddModal";
 import { findExistingPlaylist } from "../components/playlistMatch";
 
 async function kickQueue() {
-  try {
-    await api.processQueue();
-  } catch {
-    /* scheduler */
-  }
+  void api.processQueue().catch(() => undefined);
 }
 
 export function DiscoverPage() {
@@ -93,6 +89,7 @@ export function DiscoverPage() {
           title: hit.title,
           yt_id: hit.id,
           thumbnail_url: hit.thumbnail_url,
+          parent_source_id: channelSource.id,
           ...(videoIds != null ? { wanted_video_ids: videoIds } : {}),
         };
         if (!existing) {
@@ -103,9 +100,22 @@ export function DiscoverPage() {
             monitor_mode: playlistMode,
           });
           if (videoIds != null) await api.addSource(hit.url, playlistMode, playlistOpts);
-          else await api.backfillSource(existing.id, false);
+          else {
+            await api.backfillSource(existing.id, false);
+            await api.addSource(hit.url, playlistMode, {
+              parent_source_id: channelSource.id,
+              title: hit.title,
+              yt_id: hit.id,
+            });
+          }
         } else if (videoIds != null) {
           await api.addSource(hit.url, playlistMode, playlistOpts);
+        } else {
+          await api.addSource(hit.url, "all", {
+            parent_source_id: channelSource.id,
+            title: hit.title,
+            yt_id: hit.id,
+          });
         }
       }
 

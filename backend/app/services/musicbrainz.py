@@ -186,6 +186,7 @@ def embed_audio_tags(
             errors="replace",
             timeout=120,
             check=False,
+            **ytdlp._subprocess_hide_kwargs(),
         )
         if result.returncode != 0 or not tmp.exists():
             log.warning(

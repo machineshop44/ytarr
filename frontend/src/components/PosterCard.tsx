@@ -1,17 +1,17 @@
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, type Source } from "../api";
+import { qualityLabel } from "../qualityOptions";
 
 type PosterCardProps = {
   source: Source;
+  selectMode?: boolean;
+  selected?: boolean;
+  onToggleSelect?: () => void;
 };
 
-function qualityLabel(quality: string | undefined): string {
-  const q = (quality || "").trim();
-  if (!q || q === "best") return "Any";
-  return q;
-}
-
-export function PosterCard({ source }: PosterCardProps) {
+export function PosterCard({ source, selectMode, selected, onToggleSelect }: PosterCardProps) {
+  const [artState, setArtState] = useState<"loading" | "loaded" | "failed">("loading");
   const progress =
     source.video_count > 0
       ? `${source.downloaded_count}/${source.video_count}`
@@ -34,16 +34,33 @@ export function PosterCard({ source }: PosterCardProps) {
       ? "poster-status-wanted"
       : "poster-status-ok";
 
-  return (
-    <Link to={api.sourceDetailPath(source.id)} className="poster-card">
+  const posterBust = source.poster_path || String(source.id);
+  useEffect(() => {
+    setArtState("loading");
+  }, [source.id, posterBust]);
+
+  const body = (
+    <>
       <div className="poster-card-art">
-        {source.poster_path ? (
-          <img src={api.posterUrl(source.id)} alt="" />
-        ) : (
-          <div className="poster-card-placeholder">No poster</div>
+        <img
+          src={api.posterUrl(source.id, posterBust)}
+          alt=""
+          style={{ display: artState === "loaded" ? "block" : "none" }}
+          onLoad={() => setArtState("loaded")}
+          onError={() => setArtState("failed")}
+        />
+        {artState !== "loaded" && (
+          <div className="poster-card-placeholder">
+            {artState === "failed" || !source.poster_path ? "No poster" : ""}
+          </div>
         )}
-        {!monitored && <span className="poster-card-badge muted-badge">Off</span>}
-        {monitored && source.wanted_count > 0 && (
+        {selectMode && (
+          <span className={`poster-select-check${selected ? " is-selected" : ""}`} aria-hidden>
+            {selected ? "✓" : ""}
+          </span>
+        )}
+        {!selectMode && !monitored && <span className="poster-card-badge muted-badge">Off</span>}
+        {!selectMode && monitored && source.wanted_count > 0 && (
           <span className="poster-card-badge wanted-badge">{source.wanted_count}</span>
         )}
         <div className={`poster-status-bar ${statusClass}`} />
@@ -53,14 +70,38 @@ export function PosterCard({ source }: PosterCardProps) {
           {source.title}
         </div>
         <div className="poster-card-line">
-          {kindLabel} · {monitored ? "Monitored" : "Downloaded"}
+          {kindLabel}
+          {source.source_type === "channel" && (source.nested_playlist_count ?? 0) > 0
+            ? ` · ${source.nested_playlist_count} playlist${
+                (source.nested_playlist_count ?? 0) === 1 ? "" : "s"
+              }`
+            : ""}{" "}
+          · {monitored ? "Monitored" : "Downloaded"}
         </div>
         <div className="poster-card-line muted">
-          <span>{qualityLabel(source.quality)}</span>
+          <span>{qualityLabel(source.quality, source.media_type)}</span>
           <span>·</span>
           <span>{progress}</span>
         </div>
       </div>
+    </>
+  );
+
+  if (selectMode) {
+    return (
+      <button
+        type="button"
+        className={`poster-card poster-card-selectable${selected ? " is-selected" : ""}`}
+        onClick={onToggleSelect}
+      >
+        {body}
+      </button>
+    );
+  }
+
+  return (
+    <Link to={`/channel/${source.id}`} className="poster-card">
+      {body}
     </Link>
   );
 }

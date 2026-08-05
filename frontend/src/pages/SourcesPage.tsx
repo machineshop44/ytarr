@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api, type Source } from "../api";
-import { MEDIA_TYPE_OPTIONS, QUALITY_OPTIONS } from "../qualityOptions";
+import { MEDIA_TYPE_OPTIONS, coerceQualityForMedia, qualityOptionsFor } from "../qualityOptions";
 
 type AddMode = "new" | "all" | "video";
 
@@ -163,14 +163,14 @@ export function SourcesPage() {
 
         <div className="row" style={{ gap: "0.75rem" }}>
           <div className="field grow">
-            <label htmlFor="src-quality">Quality</label>
+            <label htmlFor="src-quality">{mediaType === "audio" ? "Music quality" : "Video quality"}</label>
             <select
               id="src-quality"
               value={quality}
               disabled={busy}
               onChange={(e) => setQuality(e.target.value)}
             >
-              {QUALITY_OPTIONS.map((o) => (
+              {qualityOptionsFor(mediaType).map((o) => (
                 <option key={o.value || "default"} value={o.value}>
                   {o.label}
                 </option>
@@ -183,7 +183,11 @@ export function SourcesPage() {
               id="src-media"
               value={mediaType}
               disabled={busy}
-              onChange={(e) => setMediaType(e.target.value as "video" | "audio")}
+              onChange={(e) => {
+                const next = e.target.value as "video" | "audio";
+                setMediaType(next);
+                setQuality((q) => coerceQualityForMedia(q, next));
+              }}
             >
               {MEDIA_TYPE_OPTIONS.map((o) => (
                 <option key={o.value} value={o.value}>

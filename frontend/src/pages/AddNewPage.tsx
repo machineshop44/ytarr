@@ -3,7 +3,7 @@ import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { api, type SearchHit, type Source } from "../api";
 import { ChannelAddModal } from "../components/ChannelAddModal";
 import { findExistingPlaylist } from "../components/playlistMatch";
-import { MEDIA_TYPE_OPTIONS, QUALITY_OPTIONS } from "../qualityOptions";
+import { MEDIA_TYPE_OPTIONS, coerceQualityForMedia, qualityOptionsFor } from "../qualityOptions";
 
 type SearchKind = "channel" | "playlist" | "video";
 type AddMode = "new" | "all" | "video";
@@ -37,11 +37,8 @@ function formatDuration(seconds: number | null): string {
 }
 
 async function kickQueue() {
-  try {
-    await api.processQueue();
-  } catch {
-    /* scheduler will catch up */
-  }
+  // Fire-and-forget — /queue/process starts a background worker and returns immediately
+  void api.processQueue().catch(() => undefined);
 }
 
 function SearchSkeleton() {
@@ -192,6 +189,7 @@ export function AddNewPage() {
 
   const onMediaTypeChange = (next: "video" | "audio") => {
     setMediaType(next);
+    setQuality((q) => coerceQualityForMedia(q, next));
     const nextKind = defaultKindForMedia(next);
     setKind(nextKind);
     setAddMode(defaultModeForKind(nextKind));
@@ -242,15 +240,12 @@ export function AddNewPage() {
           ? "none"
           : "all"
         : "none";
-      const baseOpts = {
+      const channelSource = await api.addSource(pickerChannel.url, channelMode, {
         quality,
         media_type: mediaType,
         title: pickerChannel.title,
         yt_id: pickerChannel.id,
         thumbnail_url: pickerChannel.thumbnail_url,
-      };
-      const channelSource = await api.addSource(pickerChannel.url, channelMode, {
-        ...baseOpts,
         ...(selection.monitorUploads && selection.uploadVideoIds != null
           ? { wanted_video_ids: selection.uploadVideoIds }
           : {}),
@@ -265,7 +260,12 @@ export function AddNewPage() {
         let pl = existing;
         const playlistMode = videoIds != null ? "none" : "all";
         const playlistOpts = {
-          ...baseOpts,
+          quality,
+          media_type: mediaType,
+          title: hit.title,
+          yt_id: hit.id,
+          thumbnail_url: hit.thumbnail_url,
+          parent_source_id: channelSource.id,
           ...(videoIds != null ? { wanted_video_ids: videoIds } : {}),
         };
         if (!pl) {
@@ -281,10 +281,21 @@ export function AddNewPage() {
             await api.addSource(hit.url, playlistMode, playlistOpts);
           } else {
             await api.backfillSource(pl.id, false);
+            // Ensure nesting even if playlist already existed
+            await api.addSource(hit.url, playlistMode, {
+              parent_source_id: channelSource.id,
+              title: hit.title,
+              yt_id: hit.id,
+            });
           }
         } else if (videoIds != null) {
           await api.addSource(hit.url, playlistMode, playlistOpts);
         } else {
+          await api.addSource(hit.url, "all", {
+            parent_source_id: channelSource.id,
+            title: hit.title,
+            yt_id: hit.id,
+          });
           await api.checkSource(pl.id);
         }
         setAdded((prev) => [pl!, ...prev.filter((s) => s.id !== pl!.id)]);
@@ -434,13 +445,13 @@ export function AddNewPage() {
 
         <div className="row" style={{ marginTop: "0.75rem", gap: "0.75rem" }}>
           <div className="field grow" style={{ marginBottom: 0 }}>
-            <label htmlFor="add-quality">Quality</label>
+            <label htmlFor="add-quality">{mediaType === "audio" ? "Music quality" : "Video quality"}</label>
             <select
               id="add-quality"
               value={quality}
               onChange={(e) => setQuality(e.target.value)}
             >
-              {QUALITY_OPTIONS.map((o) => (
+              {qualityOptionsFor(mediaType).map((o) => (
                 <option key={o.value || "default"} value={o.value}>
                   {o.label}
                 </option>

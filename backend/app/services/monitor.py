@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -27,12 +28,92 @@ def _library_root_for(source: MonitoredSource) -> Path:
 
 def ensure_artwork(db: Session, source: MonitoredSource) -> MonitoredSource:
     folder = _library_root_for(source) / source.folder_name
+    # Nested playlists often share the parent channel folder — don't clobber channel poster.jpg
+    if source.parent_source_id and (source.source_type or "").lower() == "playlist":
+        parent = db.get(MonitoredSource, source.parent_source_id)
+        if parent and parent.folder_name == source.folder_name:
+            if parent.poster_path and Path(parent.poster_path).is_file():
+                source.poster_path = parent.poster_path
+                source.fanart_path = parent.fanart_path or parent.poster_path
+                db.add(source)
+                db.commit()
+                db.refresh(source)
+                return source
+            folder = folder / "_playlist_art" / ytdlp._safe_folder_name(
+                source.yt_id or f"playlist-{source.id}"
+            )
     folder.mkdir(parents=True, exist_ok=True)
     poster, fanart = ytdlp.fetch_channel_artwork(source.url, folder)
-    if poster:
+
+    # Fall back to a catalog video thumb when channel avatar download fails
+    if not poster:
+        videos = (
+            db.query(Video)
+            .filter(Video.source_id == source.id)
+            .order_by(Video.published_at.desc(), Video.id.desc())
+            .limit(12)
+            .all()
+        )
+        poster_file = folder / "poster.jpg"
+        for video in videos:
+            candidates: list[str] = []
+            if video.thumbnail_url:
+                candidates.append(video.thumbnail_url)
+            vid = (video.video_id or "").strip()
+            if vid:
+                candidates.append(f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg")
+                candidates.append(f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg")
+            for cand in candidates:
+                saved = ytdlp.download_image(cand, poster_file)
+                if saved:
+                    poster = saved
+                    break
+            if poster:
+                break
+
+    poster_ok = bool(poster and poster.is_file() and ytdlp._looks_like_image(poster.read_bytes()))
+    if poster_ok:
         source.poster_path = str(poster)
+    else:
+        # Keep a valid on-disk poster; only drop corrupt/missing paths (black tiles)
+        keep: Path | None = None
+        for candidate in (
+            folder / "poster.jpg",
+            Path(source.poster_path) if source.poster_path else None,
+        ):
+            if not candidate or not candidate.is_file():
+                continue
+            try:
+                data = candidate.read_bytes()
+            except OSError:
+                continue
+            if ytdlp._looks_like_image(data):
+                keep = candidate
+                break
+            try:
+                candidate.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if keep:
+            source.poster_path = str(keep)
+            poster = keep
+        else:
+            source.poster_path = None
+            poster = None
+
     if fanart:
         source.fanart_path = str(fanart)
+    elif poster and poster.is_file():
+        fanart_file = folder / "fanart.jpg"
+        if not fanart_file.exists():
+            try:
+                import shutil
+
+                shutil.copy2(poster, fanart_file)
+                source.fanart_path = str(fanart_file)
+            except OSError:
+                pass
+
     db.add(source)
     db.commit()
     db.refresh(source)
@@ -111,12 +192,16 @@ def add_source(
     yt_id: str | None = None,
     thumbnail_url: str | None = None,
     channel: str | None = None,
+    parent_source_id: int | None = None,
 ) -> MonitoredSource:
     """Add a source.
 
     ``wanted_video_ids``:
       - ``None`` — honor ``mode`` for the whole catalog (Sonarr season monitor).
       - ``list`` — only those episodes become wanted; rest ignored; mode becomes ``none``.
+
+    ``parent_source_id``:
+      Nest a playlist under a channel so the library shows one poster for the channel.
     """
     url = url.strip()
     mode = (mode or "all").strip().lower()
@@ -128,6 +213,15 @@ def add_source(
     quality = (quality or "").strip().lower()
     selective = wanted_video_ids is not None
 
+    parent_id: int | None = None
+    if parent_source_id is not None:
+        parent = db.get(MonitoredSource, int(parent_source_id))
+        if not parent:
+            raise ValueError("parent_source_id does not exist")
+        if parent.source_type != "channel":
+            raise ValueError("parent_source_id must be a channel")
+        parent_id = parent.id
+
     url_kind = ytdlp.classify_url(url)
     if mode == "video" and url_kind != "video":
         raise ValueError(
@@ -135,13 +229,37 @@ def add_source(
         )
     if mode in {"new", "all", "none"} and url_kind == "video":
         mode = "video"
+    if parent_id is not None and url_kind != "playlist":
+        raise ValueError("Only playlists can nest under a channel parent")
 
     existing = db.query(MonitoredSource).filter(MonitoredSource.url == url).one_or_none()
     if existing:
+        changed = False
+        if parent_id is not None and getattr(existing, "parent_source_id", None) != parent_id:
+            existing.parent_source_id = parent_id
+            changed = True
         if selective:
-            # Ensure catalog is listed, then apply episode selection
-            check_source(db, existing, initial=False, mode="none")
-            apply_episode_selection(db, existing, wanted_video_ids or [])
+            source_id = existing.id
+            picks = list(wanted_video_ids or [])
+
+            def _bg_selective() -> None:
+                s = SessionLocal()
+                try:
+                    row = s.get(MonitoredSource, source_id)
+                    if not row:
+                        return
+                    check_source(s, row, initial=False, mode="none")
+                    apply_episode_selection(s, row, picks)
+                    downloader.enqueue_wanted(s)
+                except Exception:
+                    s.rollback()
+                finally:
+                    s.close()
+
+            threading.Thread(target=_bg_selective, daemon=True).start()
+        if changed:
+            db.add(existing)
+            db.commit()
             db.refresh(existing)
         return existing
 
@@ -186,6 +304,7 @@ def add_source(
         monitor_mode=effective_mode,
         quality=quality,
         media_type=media_type,
+        parent_source_id=parent_id if source_type == "playlist" else None,
         initialized=False,
     )
     db.add(source)
@@ -195,7 +314,7 @@ def add_source(
     folder = _library_root_for(source) / source.folder_name
     folder.mkdir(parents=True, exist_ok=True)
 
-    # Quick poster from known thumb; defer heavy artwork (extra yt-dlp) for structure-only
+    # Quick poster from known thumb so the UI has art immediately
     if info.thumbnail_url:
         poster = folder / "poster.jpg"
         saved = ytdlp.download_image(info.thumbnail_url, poster)
@@ -213,44 +332,54 @@ def add_source(
             db.add(source)
             db.commit()
 
-    if not structure_only:
-        try:
-            ensure_artwork(db, source)
-        except Exception:
-            db.commit()
-    else:
-        # Fanart / richer thumbs in the background so Add returns immediately
-        source_id = source.id
-
-        def _bg_artwork() -> None:
-            s = SessionLocal()
-            try:
-                row = s.get(MonitoredSource, source_id)
-                if row:
-                    ensure_artwork(s, row)
-            except Exception:
-                s.rollback()
-            finally:
-                s.close()
-
-        import threading
-
-        threading.Thread(target=_bg_artwork, daemon=True).start()
-
+    # Catalog sync + artwork + enqueue are slow (yt-dlp). Never block Add / navigation.
+    source_id = source.id
     want_set = (
         {vid.strip() for vid in (wanted_video_ids or []) if vid and vid.strip()}
         if selective
         else None
     )
-    # Initial sync: selective path lists everything as ignored except picks
-    check_source(
-        db,
-        source,
-        initial=True,
-        mode=effective_mode if not selective else "none",
-        wanted_ids=want_set,
-    )
-    downloader.enqueue_wanted(db)
+    sync_mode = effective_mode if not selective else "none"
+    # Always try artwork — library posters matter even for structure-only channels
+    do_artwork = True
+
+    def _bg_initial_sync() -> None:
+        s = SessionLocal()
+        try:
+            row = s.get(MonitoredSource, source_id)
+            if not row:
+                return
+            if do_artwork:
+                try:
+                    ensure_artwork(s, row)
+                except Exception:
+                    s.rollback()
+                    row = s.get(MonitoredSource, source_id)
+                    if not row:
+                        return
+            check_source(
+                s,
+                row,
+                initial=True,
+                mode=sync_mode,
+                wanted_ids=want_set,
+            )
+            downloader.enqueue_wanted(s)
+        except Exception as exc:
+            s.rollback()
+            try:
+                from . import applog
+
+                applog.log_error(
+                    f"Initial catalog sync failed for source id={source_id}: {exc}",
+                    source="monitor",
+                )
+            except Exception:
+                pass
+        finally:
+            s.close()
+
+    threading.Thread(target=_bg_initial_sync, name=f"ytarr-add-{source_id}", daemon=True).start()
     return source
 
 
@@ -457,6 +586,182 @@ def delete_source_files(source: MonitoredSource) -> dict:
             errors.append(f"{path}: {exc}")
 
     return {"removed": removed, "errors": errors}
+
+
+def _playlist_list_id(url: str) -> str | None:
+    from urllib.parse import parse_qs, urlparse
+
+    try:
+        q = parse_qs(urlparse(url).query)
+        vals = q.get("list") or []
+        return vals[0] if vals else None
+    except Exception:
+        return None
+
+
+def child_playlist_sources(db: Session, channel_id: int) -> list[MonitoredSource]:
+    return (
+        db.query(MonitoredSource)
+        .filter(MonitoredSource.parent_source_id == channel_id)
+        .filter(MonitoredSource.source_type == "playlist")
+        .all()
+    )
+
+
+def delete_source_tree(
+    db: Session,
+    source: MonitoredSource,
+    *,
+    delete_files: bool = False,
+) -> dict:
+    """Delete a source and nested playlist seasons (channel delete)."""
+    removed: list[str] = []
+    errors: list[str] = []
+    children: list[MonitoredSource] = []
+    if source.source_type == "channel":
+        children = child_playlist_sources(db, source.id)
+
+    for child in children:
+        if delete_files:
+            _ = list(child.videos)
+            fr = delete_source_files(child)
+            removed.extend(fr.get("removed") or [])
+            errors.extend(fr.get("errors") or [])
+        db.delete(child)
+
+    if delete_files:
+        _ = list(source.videos)
+        fr = delete_source_files(source)
+        removed.extend(fr.get("removed") or [])
+        errors.extend(fr.get("errors") or [])
+
+    db.delete(source)
+    db.commit()
+    return {
+        "removed": removed,
+        "errors": errors,
+        "nested_deleted": len(children),
+    }
+
+
+def link_orphan_playlists_fast(db: Session) -> int:
+    """Nest orphan playlists under channels without network calls.
+
+    Covers the common case where a playlist was added alongside its channel and
+    shares the channel title (looks like a duplicate library poster).
+    """
+    orphans = (
+        db.query(MonitoredSource)
+        .filter(MonitoredSource.source_type == "playlist")
+        .filter(MonitoredSource.parent_source_id.is_(None))
+        .all()
+    )
+    if not orphans:
+        return 0
+
+    channels = (
+        db.query(MonitoredSource).filter(MonitoredSource.source_type == "channel").all()
+    )
+    if not channels:
+        return 0
+
+    by_title: dict[str, list[MonitoredSource]] = {}
+    by_yt: dict[str, MonitoredSource] = {}
+    for ch in channels:
+        key = (ch.title or "").strip().lower()
+        if key:
+            by_title.setdefault(key, []).append(ch)
+        yid = (ch.yt_id or "").strip()
+        if yid:
+            by_yt[yid] = ch
+
+    linked = 0
+    for pl in orphans:
+        parent: MonitoredSource | None = None
+        title_key = (pl.title or "").strip().lower()
+        title_hits = by_title.get(title_key) or []
+        if len(title_hits) == 1:
+            parent = title_hits[0]
+        else:
+            # Older adds sometimes stored the channel UC… id on the playlist row
+            yid = (pl.yt_id or "").strip()
+            if yid and yid in by_yt and _playlist_list_id(pl.url or ""):
+                parent = by_yt[yid]
+        if parent is None:
+            continue
+        pl.parent_source_id = parent.id
+        # Prefer real playlist id from the URL when yt_id was wrongly the channel id
+        list_id = _playlist_list_id(pl.url or "")
+        if list_id and (not pl.yt_id or pl.yt_id in by_yt):
+            pl.yt_id = list_id
+        db.add(pl)
+        linked += 1
+
+    if linked:
+        db.commit()
+    return linked
+
+
+def link_orphan_playlists(db: Session) -> int:
+    """Attach standalone playlist sources to their parent channel when possible.
+
+    Fast title/id heuristics first, then each channel's live YouTube /playlists tab.
+    """
+    linked = link_orphan_playlists_fast(db)
+
+    orphans = (
+        db.query(MonitoredSource)
+        .filter(MonitoredSource.source_type == "playlist")
+        .filter(MonitoredSource.parent_source_id.is_(None))
+        .all()
+    )
+    if not orphans:
+        return linked
+
+    channels = (
+        db.query(MonitoredSource).filter(MonitoredSource.source_type == "channel").all()
+    )
+    if not channels:
+        return linked
+
+    for ch in channels:
+        try:
+            hits = ytdlp.list_channel_playlists(ch.url, limit=100)
+        except Exception:
+            continue
+        hit_ids: set[str] = set()
+        hit_titles: set[str] = set()
+        for h in hits:
+            if h.id:
+                hit_ids.add(h.id)
+            lid = _playlist_list_id(h.url or "")
+            if lid:
+                hit_ids.add(lid)
+            if h.title:
+                hit_titles.add(h.title.strip().lower())
+        if not hit_ids and not hit_titles:
+            continue
+        for pl in orphans:
+            if pl.parent_source_id is not None:
+                continue
+            pl_id = (pl.yt_id or "").strip() or _playlist_list_id(pl.url or "")
+            title_key = (pl.title or "").strip().lower()
+            id_match = bool(pl_id) and (
+                pl_id in hit_ids
+                or any(pl_id.startswith(hid) or hid.startswith(pl_id) for hid in hit_ids)
+            )
+            title_match = bool(title_key) and title_key in hit_titles
+            if id_match or title_match:
+                pl.parent_source_id = ch.id
+                if pl_id and (not pl.yt_id or str(pl.yt_id).startswith("UC")):
+                    lid = _playlist_list_id(pl.url or "") or (pl_id if not pl_id.startswith("UC") else None)
+                    if lid:
+                        pl.yt_id = lid
+                db.add(pl)
+                linked += 1
+    if linked:
+        db.commit()
+    return linked
 
 
 def check_all_enabled(db: Session) -> list[dict]:
