@@ -37,21 +37,32 @@ export function ActivityPage({ tab = "queue" }: ActivityPageProps) {
 
   useEffect(() => {
     let alive = true;
+    let inFlight = false;
     const tick = async () => {
+      if (inFlight) return;
+      inFlight = true;
       try {
-        const [data, settings] = await Promise.all([
+        const data =
           tab === "queue"
-            ? api.queue({ status: "active", limit: 200 })
-            : api.queue({ status: "history", limit: 100 }),
-          api.settings(),
-        ]);
+            ? await api.queue({ status: "active", limit: 200 })
+            : await api.queue({ status: "history", limit: 100 });
         if (alive) {
           setJobs(data);
-          setPaused(Boolean(settings.downloads_paused));
           setError(null);
+        }
+        // Settings only when queue tab (paused banner) — not every history poll
+        if (tab === "queue") {
+          try {
+            const settings = await api.settings();
+            if (alive) setPaused(Boolean(settings.downloads_paused));
+          } catch {
+            /* ignore */
+          }
         }
       } catch (err) {
         if (alive) setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        inFlight = false;
       }
     };
     void tick();

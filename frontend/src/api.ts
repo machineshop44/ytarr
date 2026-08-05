@@ -392,8 +392,11 @@ export const api = {
       method: "POST",
     });
   },
-  refreshArtwork: (id: number) =>
-    request<Source>(`/api/sources/${id}/refresh-artwork`, { method: "POST" }),
+  refreshArtwork: (id: number, opts?: { force?: boolean }) => {
+    const force = opts?.force !== false;
+    const q = force ? "" : "?force=false";
+    return request<Source>(`/api/sources/${id}/refresh-artwork${q}`, { method: "POST" });
+  },
   videos: (params?: { status?: string; source_id?: number; limit?: number }) => {
     const q = new URLSearchParams();
     if (params?.status) q.set("status", params.status);

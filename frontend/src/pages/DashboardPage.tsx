@@ -22,18 +22,26 @@ export function DashboardPage() {
   const [deleteFiles, setDeleteFiles] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
+  const [loading, setLoading] = useState(true);
+
   const load = async () => {
     setSources(await api.sources());
   };
 
   useEffect(() => {
     let alive = true;
+    let inFlight = false;
     const tick = async () => {
+      if (inFlight) return;
+      inFlight = true;
       try {
         await load();
         if (alive) setError(null);
       } catch (err) {
         if (alive) setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        inFlight = false;
+        if (alive) setLoading(false);
       }
     };
     void tick();
@@ -152,7 +160,7 @@ export function DashboardPage() {
       let ok = 0;
       for (const ch of targets) {
         try {
-          const updated = await api.refreshArtwork(ch.id);
+          const updated = await api.refreshArtwork(ch.id, { force: false });
           if (updated.poster_path) ok += 1;
         } catch {
           /* continue */
@@ -314,7 +322,13 @@ export function DashboardPage() {
       {error && <div className="error">{error}</div>}
       {message && <div className="success">{message}</div>}
 
-      {!libraryItems.length && !error && (
+      {loading && !libraryItems.length && !error && (
+        <div className="panel empty-library">
+          <p className="muted">Loading library…</p>
+        </div>
+      )}
+
+      {!loading && !libraryItems.length && !error && (
         <div className="panel empty-library">
           <h2 style={{ marginTop: 0 }}>Library is empty</h2>
           <p className="muted">

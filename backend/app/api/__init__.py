@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from ..config import (
     config_file_path,
@@ -70,22 +70,30 @@ def _settings_out(cfg) -> SettingsOut:
     return SettingsOut(**data)
 
 
-def _source_out(db: Session, source: MonitoredSource) -> SourceOut:
-    counts = dict(
-        db.query(Video.status, func.count(Video.id))
-        .filter(Video.source_id == source.id)
-        .group_by(Video.status)
-        .all()
-    )
-    nested = 0
-    if source.source_type == "channel":
-        nested = (
-            db.query(func.count(MonitoredSource.id))
-            .filter(MonitoredSource.parent_source_id == source.id)
-            .filter(MonitoredSource.source_type == "playlist")
-            .scalar()
-            or 0
+def _source_out(
+    db: Session,
+    source: MonitoredSource,
+    *,
+    counts: dict[str, int] | None = None,
+    nested: int | None = None,
+) -> SourceOut:
+    if counts is None:
+        counts = dict(
+            db.query(Video.status, func.count(Video.id))
+            .filter(Video.source_id == source.id)
+            .group_by(Video.status)
+            .all()
         )
+    if nested is None:
+        nested = 0
+        if source.source_type == "channel":
+            nested = (
+                db.query(func.count(MonitoredSource.id))
+                .filter(MonitoredSource.parent_source_id == source.id)
+                .filter(MonitoredSource.source_type == "playlist")
+                .scalar()
+                or 0
+            )
     return SourceOut(
         id=source.id,
         url=source.url,
@@ -390,13 +398,36 @@ def list_url_entries(url: str, limit: int = 100) -> PlaylistEntriesResponse:
 
 @router.get("/sources", response_model=list[SourceOut])
 def list_sources(db: Session = Depends(get_db)) -> list[SourceOut]:
-    # Collapse duplicate playlist posters under same-named channels (instant)
-    try:
-        monitor.link_orphan_playlists_fast(db)
-    except Exception:
-        db.rollback()
     sources = db.query(MonitoredSource).order_by(MonitoredSource.title.asc()).all()
-    return [_source_out(db, s) for s in sources]
+    if not sources:
+        return []
+    ids = [s.id for s in sources]
+    count_rows = (
+        db.query(Video.source_id, Video.status, func.count(Video.id))
+        .filter(Video.source_id.in_(ids))
+        .group_by(Video.source_id, Video.status)
+        .all()
+    )
+    counts_by_source: dict[int, dict[str, int]] = {i: {} for i in ids}
+    for source_id, status, n in count_rows:
+        counts_by_source.setdefault(int(source_id), {})[str(status)] = int(n)
+    nested_rows = (
+        db.query(MonitoredSource.parent_source_id, func.count(MonitoredSource.id))
+        .filter(MonitoredSource.parent_source_id.in_(ids))
+        .filter(MonitoredSource.source_type == "playlist")
+        .group_by(MonitoredSource.parent_source_id)
+        .all()
+    )
+    nested_by_parent = {int(pid): int(n) for pid, n in nested_rows if pid is not None}
+    return [
+        _source_out(
+            db,
+            s,
+            counts=counts_by_source.get(s.id, {}),
+            nested=nested_by_parent.get(s.id, 0) if s.source_type == "channel" else 0,
+        )
+        for s in sources
+    ]
 
 
 @router.post("/sources", response_model=SourceOut)
@@ -515,12 +546,16 @@ def check_now(source_id: int, db: Session = Depends(get_db)) -> dict:
 
 
 @router.post("/sources/{source_id}/refresh-artwork", response_model=SourceOut)
-def refresh_artwork(source_id: int, db: Session = Depends(get_db)) -> SourceOut:
+def refresh_artwork(
+    source_id: int,
+    force: bool = True,
+    db: Session = Depends(get_db),
+) -> SourceOut:
     source = db.get(MonitoredSource, source_id)
     if not source:
         raise HTTPException(status_code=404, detail="Source not found")
     try:
-        source = monitor.ensure_artwork(db, source)
+        source = monitor.ensure_artwork(db, source, force=force)
     except ytdlp.YtDlpError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _source_out(db, source)
@@ -636,7 +671,9 @@ def list_queue(
       - or a specific status / comma-separated list
     """
     limit = max(1, min(limit, 500))
-    q = db.query(DownloadJob)
+    q = db.query(DownloadJob).options(
+        joinedload(DownloadJob.video).joinedload(Video.source),
+    )
     if source_id is not None:
         q = q.join(Video, DownloadJob.video_id == Video.id).filter(Video.source_id == source_id)
     if status and status not in {"all", "*"}:

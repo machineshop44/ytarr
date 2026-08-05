@@ -26,7 +26,12 @@ def _library_root_for(source: MonitoredSource) -> Path:
     return Path(cfg.library_root)
 
 
-def ensure_artwork(db: Session, source: MonitoredSource) -> MonitoredSource:
+def ensure_artwork(
+    db: Session,
+    source: MonitoredSource,
+    *,
+    force: bool = True,
+) -> MonitoredSource:
     folder = _library_root_for(source) / source.folder_name
     # Nested playlists often share the parent channel folder — don't clobber channel poster.jpg
     if source.parent_source_id and (source.source_type or "").lower() == "playlist":
@@ -42,6 +47,16 @@ def ensure_artwork(db: Session, source: MonitoredSource) -> MonitoredSource:
             folder = folder / "_playlist_art" / ytdlp._safe_folder_name(
                 source.yt_id or f"playlist-{source.id}"
             )
+
+    existing_poster = Path(source.poster_path) if source.poster_path else folder / "poster.jpg"
+    if not force and ytdlp.image_file_ok(existing_poster):
+        if not source.poster_path:
+            source.poster_path = str(existing_poster)
+            db.add(source)
+            db.commit()
+            db.refresh(source)
+        return source
+
     folder.mkdir(parents=True, exist_ok=True)
     poster, fanart = ytdlp.fetch_channel_artwork(source.url, folder)
 
@@ -51,7 +66,7 @@ def ensure_artwork(db: Session, source: MonitoredSource) -> MonitoredSource:
             db.query(Video)
             .filter(Video.source_id == source.id)
             .order_by(Video.published_at.desc(), Video.id.desc())
-            .limit(12)
+            .limit(3)
             .all()
         )
         poster_file = folder / "poster.jpg"
@@ -71,29 +86,22 @@ def ensure_artwork(db: Session, source: MonitoredSource) -> MonitoredSource:
             if poster:
                 break
 
-    poster_ok = bool(poster and poster.is_file() and ytdlp._looks_like_image(poster.read_bytes()))
-    if poster_ok:
+    if poster and ytdlp.image_file_ok(poster):
         source.poster_path = str(poster)
     else:
-        # Keep a valid on-disk poster; only drop corrupt/missing paths (black tiles)
         keep: Path | None = None
         for candidate in (
             folder / "poster.jpg",
             Path(source.poster_path) if source.poster_path else None,
         ):
-            if not candidate or not candidate.is_file():
-                continue
-            try:
-                data = candidate.read_bytes()
-            except OSError:
-                continue
-            if ytdlp._looks_like_image(data):
+            if candidate and ytdlp.image_file_ok(candidate):
                 keep = candidate
                 break
-            try:
-                candidate.unlink(missing_ok=True)
-            except OSError:
-                pass
+            if candidate and candidate.is_file():
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError:
+                    pass
         if keep:
             source.poster_path = str(keep)
             poster = keep
@@ -398,7 +406,11 @@ def check_source(
     # Uploads unchecked). Discovery stays separate from monitoring: videos are stored
     # as SEEN (or IGNORED when wanted_ids is set) and the periodic monitor loop still
     # skips mode "none", so nothing is auto-queued.
-    entries = ytdlp.list_entries(source.url)
+    # Bounded poll for mode=new after initial sync — full dump only on first sync / all / none.
+    list_limit: int | None = None
+    if not is_initial and effective_mode == "new":
+        list_limit = 40
+    entries = ytdlp.list_entries(source.url, limit=list_limit)
     created_wanted = 0
     created_seen = 0
     created_ignored = 0

@@ -22,7 +22,8 @@ PROGRESS_RE = re.compile(
 )
 
 _which_cache: dict[str, str | None] = {}
-_ffmpeg_resolved: Any = object()  # sentinel = unset
+_FFMPEG_UNSET = object()
+_ffmpeg_resolved: Any = _FFMPEG_UNSET
 _js_runtime_cached: list[str] | None = None
 _ssl_ctx: Any = None
 _ssl_ctx_nocheck: Any = None
@@ -201,7 +202,7 @@ def _ffmpeg_candidates() -> list[Path]:
 def resolve_ffmpeg() -> Path | None:
     """Return path to ffmpeg binary, preferring the app's tools/ folder."""
     global _ffmpeg_resolved
-    if _ffmpeg_resolved is not object():
+    if _ffmpeg_resolved is not _FFMPEG_UNSET:
         return _ffmpeg_resolved  # type: ignore[return-value]
 
     cfg = get_config()
@@ -472,7 +473,7 @@ def _normalize_yt_image_url(url: str) -> str:
 
 
 def _looks_like_image(data: bytes) -> bool:
-    if not data or len(data) < 64:
+    if not data or len(data) < 12:
         return False
     if data[:3] == b"\xff\xd8\xff":
         return True
@@ -480,9 +481,55 @@ def _looks_like_image(data: bytes) -> bool:
         return True
     if data[:6] in (b"GIF87a", b"GIF89a"):
         return True
-    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return True
     return False
+
+
+def image_file_ok(path: Path) -> bool:
+    """True if path exists and starts with a known image magic header."""
+    try:
+        if not path.is_file():
+            return False
+        with path.open("rb") as fh:
+            return _looks_like_image(fh.read(16))
+    except OSError:
+        return False
+
+
+def _image_ssl_context():
+    """Reuse one SSL context across poster downloads."""
+    global _ssl_ctx, _ssl_ctx_nocheck, _ssl_ctx_key
+    import ssl
+
+    cfg = get_config()
+    nocheck = bool(cfg.nocheck_certificates)
+    if _ssl_ctx_key is not None and _ssl_ctx_key == nocheck:
+        return _ssl_ctx_nocheck if nocheck else _ssl_ctx
+
+    if nocheck:
+        _ssl_ctx_nocheck = ssl._create_unverified_context()
+        _ssl_ctx_key = True
+        return _ssl_ctx_nocheck
+
+    ctx = ssl.create_default_context()
+    if sys.platform.startswith("win"):
+        try:
+            import truststore
+
+            ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        except Exception:
+            pass
+    else:
+        try:
+            import certifi
+
+            ctx = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            pass
+    _ssl_ctx = ctx
+    _ssl_ctx_key = False
+    return ctx
 
 def classify_url(url: str) -> str:
     """Return 'video', 'playlist', or 'channel' from a YouTube URL shape."""
@@ -1051,30 +1098,11 @@ def list_entries(url: str, *, limit: int | None = None) -> list[PlaylistEntry]:
 
 def download_image(url: str, dest: Path) -> Path | None:
     try:
-        import ssl
         from urllib.request import Request, urlopen as _urlopen
 
         dest.parent.mkdir(parents=True, exist_ok=True)
         url = _normalize_yt_image_url(url)
-        cfg = get_config()
-        if cfg.nocheck_certificates:
-            ctx = ssl._create_unverified_context()
-        else:
-            ctx = ssl.create_default_context()
-            if sys.platform.startswith("win"):
-                try:
-                    import truststore
-
-                    ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                except Exception:
-                    pass
-            else:
-                try:
-                    import certifi
-
-                    ctx = ssl.create_default_context(cafile=certifi.where())
-                except Exception:
-                    pass
+        ctx = _image_ssl_context()
         req = Request(
             url,
             headers={
@@ -1089,7 +1117,7 @@ def download_image(url: str, dest: Path) -> Path | None:
         )
         with _urlopen(req, timeout=60, context=ctx) as resp:  # noqa: S310
             data = resp.read()
-        if not _looks_like_image(data):
+        if len(data) < 64 or not _looks_like_image(data):
             return None
         dest.write_bytes(data)
         return dest
@@ -1101,16 +1129,14 @@ def fetch_channel_artwork(
     url: str,
     folder: Path,
 ) -> tuple[Path | None, Path | None]:
-    """Resolve source and write poster.jpg / fanart.jpg into folder."""
-    info = resolve_source(url)
+    """Write poster.jpg / fanart.jpg into folder using one primary yt-dlp dump."""
     folder.mkdir(parents=True, exist_ok=True)
     poster = folder / "poster.jpg"
     fanart = folder / "fanart.jpg"
 
     thumbs: list[dict[str, Any]] = []
     entries: list[dict[str, Any]] = []
-    banner_url = info.banner_url
-    rich: dict[str, Any] | None = None
+    banner_url: str | None = None
     try:
         result = _run(
             ["--dump-single-json", "--flat-playlist", "--playlist-end", "5", "--no-download", url],
@@ -1120,20 +1146,20 @@ def fetch_channel_artwork(
             rich = json.loads(result.stdout)
             thumbs = list(rich.get("thumbnails") or [])
             entries = [e for e in (rich.get("entries") or []) if isinstance(e, dict)]
-            if not banner_url:
-                for t in thumbs:
-                    u = t.get("url") or ""
-                    tid = str(t.get("id") or "").lower()
-                    if "banner" in u or "banner" in tid:
-                        banner_url = u
-                        break
+            for t in thumbs:
+                u = t.get("url") or ""
+                tid = str(t.get("id") or "").lower()
+                if "banner" in u or "banner" in tid:
+                    banner_url = u
+                    break
+            seed = _pick_channel_poster(thumbs) or rich.get("thumbnail")
+            candidates = _channel_poster_candidates(thumbs, entries)
+            if seed:
+                candidates = [str(seed)] + [u for u in candidates if u != str(seed)]
+        else:
+            candidates = []
     except Exception:
-        rich = None
-
-    candidates = _channel_poster_candidates(thumbs, entries)
-    if info.thumbnail_url:
-        # Keep resolve() pick early in the list without duplicating
-        candidates = [info.thumbnail_url] + [u for u in candidates if u != info.thumbnail_url]
+        candidates = []
 
     poster_path = None
     for cand in candidates:
@@ -1141,7 +1167,7 @@ def fetch_channel_artwork(
         if poster_path:
             break
 
-    # Last-ditch: richer non-flat dump for avatar list
+    # Rare fallback dump when flat listing had no usable avatar
     if not poster_path:
         try:
             result = _run(

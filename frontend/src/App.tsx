@@ -81,7 +81,10 @@ export default function App() {
   useEffect(() => {
     if (needsLogin || authChecking) return;
     let alive = true;
+    let inFlight = false;
     const load = async () => {
+      if (inFlight) return;
+      inFlight = true;
       try {
         const d = await api.dashboard();
         if (alive) setDash(d);
@@ -91,6 +94,8 @@ export default function App() {
           setNeedsLogin(true);
           setAuthUser(null);
         }
+      } finally {
+        inFlight = false;
       }
     };
     void load();

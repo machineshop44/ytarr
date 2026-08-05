@@ -99,26 +99,25 @@ export function ChannelDetailPage() {
     setAllSources(sources);
     setSource(found);
     setUploadVideos(vids);
-    return found;
+    return { source: found, sources };
   }, [id]);
 
   useEffect(() => {
     let alive = true;
+    let playlistsLoaded = false;
     const run = async () => {
       setLoading(true);
       setError(null);
       try {
-        const found = await loadCore();
+        const { source: found, sources: sourcesNow } = await loadCore();
         if (!alive) return;
-        if (found.source_type === "channel") {
+        if (found.source_type === "channel" && !playlistsLoaded) {
+          playlistsLoaded = true;
           setLoadingPlaylists(true);
           try {
             const res = await api.channelPlaylists(found.url, 50);
-            if (alive) setPlaylists(res.results);
-            // Prefetch playlist catalogs so Uploads can hide duplicates
-            const sourcesNow = await api.sources();
             if (!alive) return;
-            setAllSources(sourcesNow);
+            setPlaylists(res.results);
             await Promise.all(
               res.results.map(async (hit) => {
                 const existing = findExistingPlaylist(sourcesNow, hit);
@@ -138,7 +137,7 @@ export function ChannelDetailPage() {
           } finally {
             if (alive) setLoadingPlaylists(false);
           }
-        } else {
+        } else if (found.source_type !== "channel") {
           setPlaylists([]);
           setExpandedKeys(new Set(["self"]));
         }
@@ -149,12 +148,26 @@ export function ChannelDetailPage() {
       }
     };
     void run();
-    const timer = window.setInterval(() => {
-      void loadCore().catch(() => undefined);
-    }, source && !source.initialized ? 2000 : 8000);
     return () => {
       alive = false;
-      window.clearInterval(timer);
+    };
+  }, [loadCore]);
+
+  // Quiet core refresh — do not re-run playlist waterfall when initialized flips
+  useEffect(() => {
+    let inFlight = false;
+    const ms = source && !source.initialized ? 2000 : 8000;
+    const id = window.setInterval(() => {
+      if (inFlight) return;
+      inFlight = true;
+      void loadCore()
+        .catch(() => undefined)
+        .finally(() => {
+          inFlight = false;
+        });
+    }, ms);
+    return () => {
+      window.clearInterval(id);
     };
   }, [loadCore, source?.initialized]);
 
