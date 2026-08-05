@@ -20,18 +20,39 @@ _active = 0
 MIN_FREE_BYTES = 500 * 1024 * 1024
 
 
-def _find_downloaded_file(video_id: str) -> Path | None:
+def _find_downloaded_file(
+    video_id: str,
+    *,
+    prefer_dirs: list[Path] | None = None,
+) -> Path | None:
     cfg = get_config()
     needles = (f"[{video_id}]", f"({video_id})")
-    for root in (Path(cfg.library_root), Path(cfg.music_library_root)):
+    roots: list[Path] = []
+    for p in list(prefer_dirs or []) + [Path(cfg.library_root), Path(cfg.music_library_root)]:
+        if p not in roots:
+            roots.append(p)
+
+    def _scan(root: Path, *, recursive: bool) -> Path | None:
         if not root.exists():
-            continue
+            return None
         try:
-            for path in root.rglob("*"):
+            iterator = root.rglob("*") if recursive else root.iterdir()
+            for path in iterator:
                 if path.is_file() and any(n in path.name for n in needles):
                     return path
         except OSError:
-            continue
+            return None
+        return None
+
+    # Prefer source folder (shallow, then recursive) before whole-library rglob
+    for root in prefer_dirs or []:
+        hit = _scan(root, recursive=False) or _scan(root, recursive=True)
+        if hit:
+            return hit
+    for root in (Path(cfg.library_root), Path(cfg.music_library_root)):
+        hit = _scan(root, recursive=True)
+        if hit:
+            return hit
     return None
 
 
@@ -60,7 +81,16 @@ def recover_interrupted_downloads() -> dict:
             if video.file_path and Path(video.file_path).exists():
                 existing = Path(video.file_path)
             if existing is None:
-                existing = _find_downloaded_file(video.video_id)
+                prefer: list[Path] = []
+                source = video.source or db.get(MonitoredSource, video.source_id)
+                if source:
+                    root = (
+                        Path(get_config().music_library_root)
+                        if (source.media_type or "video").strip().lower() == "audio"
+                        else Path(get_config().library_root)
+                    )
+                    prefer.append(root / source.folder_name)
+                existing = _find_downloaded_file(video.video_id, prefer_dirs=prefer)
             if existing is not None:
                 video.status = VideoStatus.DOWNLOADED.value
                 video.file_path = str(existing)
@@ -114,13 +144,29 @@ def enqueue_wanted(db: Session) -> int:
     return count
 
 
+_progress_last: dict[int, tuple[float, float]] = {}  # job_id -> (monotonic_ts, pct)
+
+
 def _set_progress(db: Session, job_id: int, pct: float) -> None:
+    """Throttle SQLite commits — yt-dlp emits many % lines per second."""
+    import time
+
+    pct = max(0.0, min(100.0, pct))
+    now = time.monotonic()
+    prev = _progress_last.get(job_id)
+    if prev is not None:
+        last_ts, last_pct = prev
+        if pct < 100.0 and (now - last_ts) < 1.0 and abs(pct - last_pct) < 2.0:
+            return
+    _progress_last[job_id] = (now, pct)
     job = db.get(DownloadJob, job_id)
     if not job:
         return
-    job.progress = max(0.0, min(100.0, pct))
+    job.progress = pct
     db.add(job)
     db.commit()
+    if pct >= 100.0:
+        _progress_last.pop(job_id, None)
 
 
 def _is_disk_full_error(exc: Exception) -> bool:

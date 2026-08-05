@@ -21,6 +21,19 @@ PROGRESS_RE = re.compile(
     r"\[download\]\s+(?P<pct>\d+(?:\.\d+)?)%"
 )
 
+_which_cache: dict[str, str | None] = {}
+_ffmpeg_resolved: Any = object()  # sentinel = unset
+_js_runtime_cached: list[str] | None = None
+_ssl_ctx: Any = None
+_ssl_ctx_nocheck: Any = None
+_ssl_ctx_key: bool | None = None
+
+
+def _which(cmd: str) -> str | None:
+    if cmd not in _which_cache:
+        _which_cache[cmd] = shutil.which(cmd)
+    return _which_cache[cmd]
+
 
 class YtDlpError(RuntimeError):
     pass
@@ -139,7 +152,7 @@ def _ytdlp_cmd() -> list[str]:
     if path.exists():
         return [str(path)]
 
-    found = shutil.which(configured)
+    found = _which(configured)
     if found:
         return [found]
 
@@ -187,8 +200,13 @@ def _ffmpeg_candidates() -> list[Path]:
 
 def resolve_ffmpeg() -> Path | None:
     """Return path to ffmpeg binary, preferring the app's tools/ folder."""
+    global _ffmpeg_resolved
+    if _ffmpeg_resolved is not object():
+        return _ffmpeg_resolved  # type: ignore[return-value]
+
     cfg = get_config()
     configured = (cfg.ffmpeg_path or "").strip()
+    found: Path | None = None
     if configured:
         p = Path(configured)
         if not p.is_absolute():
@@ -198,22 +216,28 @@ def resolve_ffmpeg() -> Path | None:
         if p.is_dir():
             exe = p / ("ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg")
             if exe.exists():
-                return exe
-        if p.exists():
-            return p
+                found = exe
+        elif p.exists():
+            found = p
 
-    bundled = _bundled_ffmpeg()
-    if bundled:
-        return bundled
+    if found is None:
+        bundled = _bundled_ffmpeg()
+        if bundled:
+            found = bundled
 
-    which = shutil.which("ffmpeg")
-    if which:
-        return Path(which)
+    if found is None:
+        which = _which("ffmpeg")
+        if which:
+            found = Path(which)
 
-    for candidate in _ffmpeg_candidates():
-        if candidate.exists():
-            return candidate
-    return None
+    if found is None:
+        for candidate in _ffmpeg_candidates():
+            if candidate.exists():
+                found = candidate
+                break
+
+    _ffmpeg_resolved = found
+    return found
 
 
 def _ffmpeg_available() -> bool:
@@ -231,11 +255,16 @@ def _ffmpeg_location_args() -> list[str]:
 
 def _js_runtime_args() -> list[str]:
     """YouTube extraction increasingly needs a JS runtime (Node or Deno)."""
-    if shutil.which("node"):
-        return ["--js-runtimes", "node"]
-    if shutil.which("deno"):
-        return ["--js-runtimes", "deno"]
-    return []
+    global _js_runtime_cached
+    if _js_runtime_cached is not None:
+        return list(_js_runtime_cached)
+    if _which("node"):
+        _js_runtime_cached = ["--js-runtimes", "node"]
+    elif _which("deno"):
+        _js_runtime_cached = ["--js-runtimes", "deno"]
+    else:
+        _js_runtime_cached = []
+    return list(_js_runtime_cached)
 
 
 def _resolve_format(format_selector: str) -> tuple[str, bool]:
