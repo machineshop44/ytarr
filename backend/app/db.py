@@ -14,7 +14,7 @@ class Base(DeclarativeBase):
 
 engine = create_engine(
     database_url(),
-    connect_args={"check_same_thread": False},
+    connect_args={"check_same_thread": False, "timeout": 30},
 )
 
 
@@ -22,6 +22,9 @@ engine = create_engine(
 def _set_sqlite_pragma(dbapi_connection, connection_record) -> None:  # noqa: ARG001
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA busy_timeout=30000")
+    cursor.execute("PRAGMA synchronous=NORMAL")
     cursor.close()
 
 
@@ -42,6 +45,21 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _ensure_sqlite_columns()
     _migrate_video_unique_constraint()
+    _ensure_indexes()
+
+
+def _ensure_indexes() -> None:
+    """Hot-path indexes for queue/dashboard/library filters."""
+    stmts = (
+        "CREATE INDEX IF NOT EXISTS ix_videos_status ON videos (status)",
+        "CREATE INDEX IF NOT EXISTS ix_videos_source_status ON videos (source_id, status)",
+        "CREATE INDEX IF NOT EXISTS ix_download_jobs_status ON download_jobs (status)",
+        "CREATE INDEX IF NOT EXISTS ix_monitored_sources_enabled ON monitored_sources (enabled)",
+        "CREATE INDEX IF NOT EXISTS ix_monitored_sources_parent ON monitored_sources (parent_source_id)",
+    )
+    with engine.begin() as conn:
+        for sql in stmts:
+            conn.exec_driver_sql(sql)
 
 
 def _ensure_sqlite_columns() -> None:
