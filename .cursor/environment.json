@@ -1,0 +1,20 @@
+{
+  "name": "ytarr",
+  "install": "cd /agent/repos/ytarr && sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3.12-venv ffmpeg && python3 -m venv .venv && ./.venv/bin/python -m pip install --upgrade pip && ./.venv/bin/pip install -r backend/requirements.txt && npm --prefix frontend ci",
+  "terminals": [
+    {
+      "name": "backend",
+      "command": "cd /agent/repos/ytarr/backend && ../.venv/bin/python run.py",
+      "description": "ytarr FastAPI backend (Uvicorn) on http://0.0.0.0:8199"
+    },
+    {
+      "name": "frontend",
+      "command": "cd /agent/repos/ytarr/frontend && npm run dev -- --host 0.0.0.0",
+      "description": "ytarr Vite/React dev server on http://localhost:5173 (proxies /api to :8199)"
+    }
+  ],
+  "ports": [
+    { "name": "backend api", "port": 8199 },
+    { "name": "frontend dev", "port": 5173 }
+  ]
+}
