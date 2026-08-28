@@ -52,6 +52,13 @@ class AppConfig(BaseModel):
     ytdlp_path: str = "yt-dlp"
     # Empty = auto-detect bundled tools/ffmpeg, then PATH
     ffmpeg_path: str = ""
+    # Optional Netscape cookies.txt for age-gate / bot 403s (preferred on Windows)
+    ytdlp_cookies_path: str = ""
+    # Optional: chrome | edge | firefox | brave | chromium (empty = off).
+    # Ignored when ytdlp_cookies_path points to an existing file. Chrome/Edge on
+    # Windows often fail with DPAPI / App-Bound encryption — prefer cookies.txt
+    # or Firefox (see yt-dlp#10927).
+    ytdlp_cookies_from_browser: str = ""
     # Named preset: best | 2160p | 1080p | 720p | 480p | worst | custom
     default_quality: str = "best"
     # Music: best | 320k | 192k | 128k | 64k | worst | custom
@@ -77,6 +84,18 @@ class AppConfig(BaseModel):
     )
     # Optional mappings so docs / future agents know how host paths appear on Plex
     path_mappings: list[PathMapping] = Field(default_factory=list)
+    # Settings → Connect → Plex (Arr-style library refresh)
+    plex_enabled: bool = False
+    plex_url: str = "http://127.0.0.1:32400"
+    plex_token: str = ""
+    plex_video_section_id: str = ""
+    plex_music_section_id: str = ""
+    plex_refresh_debounce_seconds: int = 45
+    # Settings → Connect → Webhook (Discord-compatible JSON)
+    connect_webhook_url: str = ""
+    connect_on_download: bool = True
+    connect_on_failure: bool = True
+    connect_on_grab: bool = False
     # Sonarr-style API key for mobile hubs / remote clients (X-Api-Key)
     api_key: str = ""
     # When True, /api/* requires X-Api-Key or ?apikey= (ignored when Forms session is valid)
@@ -121,7 +140,14 @@ def resolve_paths(cfg: AppConfig) -> AppConfig:
     """Resolve relative paths against project root (portable installs)."""
     cfg.host = normalize_bind_host(cfg.host)
 
-    for field in ("data_dir", "library_root", "music_library_root", "ffmpeg_path", "ytdlp_path"):
+    for field in (
+        "data_dir",
+        "library_root",
+        "music_library_root",
+        "ffmpeg_path",
+        "ytdlp_path",
+        "ytdlp_cookies_path",
+    ):
         raw = (getattr(cfg, field) or "").strip()
         if not raw:
             continue

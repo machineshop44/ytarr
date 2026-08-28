@@ -90,3 +90,21 @@ def stop_scheduler() -> None:
     if _scheduler:
         _scheduler.shutdown(wait=False)
         _scheduler = None
+
+
+def list_tasks() -> list[dict]:
+    """Arr-style System → Tasks snapshot."""
+    if not _scheduler:
+        return []
+    out: list[dict] = []
+    for job in _scheduler.get_jobs():
+        next_run = job.next_run_time
+        out.append(
+            {
+                "id": job.id,
+                "name": job.name or job.id,
+                "next_run_time": next_run.isoformat() if next_run else None,
+                "trigger": str(job.trigger),
+            }
+        )
+    return out

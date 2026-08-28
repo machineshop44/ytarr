@@ -247,7 +247,10 @@ def discover_from_library(
         source_kind = sources_by_tag.get(key, "title_tag")
         try:
             hits = ytdlp.search_youtube(tag, kind="channel", limit=per_tag + 4)
-        except ytdlp.YtDlpError:
+        except ytdlp.YtDlpError as exc:
+            # Surface cookie/DPAPI failures instead of empty Discover sections
+            if ytdlp._is_dpapi_cookie_error(str(exc)):
+                raise
             continue
 
         results: list[DiscoverHit] = []

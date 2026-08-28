@@ -49,9 +49,11 @@ async def lifespan(_app: FastAPI):
         from .services import monitor
 
         def _link_playlists() -> None:
+            import time
+
             s = SessionLocal()
             try:
-                n = monitor.link_orphan_playlists(s)
+                n = monitor.link_orphan_playlists_fast(s)
                 if n:
                     from .services import applog
 
@@ -63,6 +65,24 @@ async def lifespan(_app: FastAPI):
                 s.rollback()
             finally:
                 s.close()
+            # YouTube /playlists scrape is slow — don't block boot; cap channels.
+            time.sleep(45)
+            s2 = SessionLocal()
+            try:
+                n2 = monitor.link_orphan_playlists(
+                    s2, scrape=True, max_channels=5, skip_fast=True
+                )
+                if n2:
+                    from .services import applog
+
+                    applog.log_info(
+                        f"Nested {n2} more playlist(s) after YouTube playlist lookup",
+                        source="startup",
+                    )
+            except Exception:
+                s2.rollback()
+            finally:
+                s2.close()
 
         threading.Thread(target=_link_playlists, name="ytarr-link-playlists", daemon=True).start()
     except Exception:

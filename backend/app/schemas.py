@@ -93,6 +93,7 @@ class SourceUpdate(BaseModel):
     monitor_mode: str | None = Field(default=None, pattern="^(new|all|video|none)$")
     quality: str | None = None
     media_type: str | None = Field(default=None, pattern="^(video|audio)$")
+    tags: str | None = None
 
 
 class SourceOut(BaseModel):
@@ -103,12 +104,17 @@ class SourceOut(BaseModel):
     source_type: str
     enabled: bool
     monitor_mode: str
+    # YouTube About text — null when we have not looked it up yet
+    description: str | None = None
+    subscriber_count: int | None = None
     quality: str = ""
     media_type: str = "video"
     folder_name: str
     poster_path: str | None
     fanart_path: str | None
     parent_source_id: int | None = None
+    tags: str = ""
+    season_number: int = 1
     last_checked: datetime | None
     initialized: bool
     created_at: datetime
@@ -132,6 +138,7 @@ class VideoOut(BaseModel):
     file_path: str | None
     status: str
     error: str | None
+    retry_count: int = 0
     source_title: str | None = None
     created_at: datetime
 
@@ -167,6 +174,8 @@ class SettingsOut(BaseModel):
     music_library_root: str = ""
     ytdlp_path: str
     ffmpeg_path: str = ""
+    ytdlp_cookies_path: str = ""
+    ytdlp_cookies_from_browser: str = ""
     default_quality: str = "best"
     default_music_quality: str = "best"
     format: str
@@ -183,6 +192,16 @@ class SettingsOut(BaseModel):
         "music_offtopic,sponsor,selfpromo,interaction,intro,outro"
     )
     path_mappings: list[PathMappingOut] = []
+    plex_enabled: bool = False
+    plex_url: str = "http://127.0.0.1:32400"
+    plex_token: str = ""
+    plex_video_section_id: str = ""
+    plex_music_section_id: str = ""
+    plex_refresh_debounce_seconds: int = 45
+    connect_webhook_url: str = ""
+    connect_on_download: bool = True
+    connect_on_failure: bool = True
+    connect_on_grab: bool = False
     api_key: str = ""
     api_auth_required: bool = True
     authentication_method: str = "forms"
@@ -201,6 +220,8 @@ class SettingsUpdate(BaseModel):
     music_library_root: str | None = None
     ytdlp_path: str | None = None
     ffmpeg_path: str | None = None
+    ytdlp_cookies_path: str | None = None
+    ytdlp_cookies_from_browser: str | None = None
     default_quality: str | None = None
     default_music_quality: str | None = None
     format: str | None = None
@@ -218,6 +239,16 @@ class SettingsUpdate(BaseModel):
     sponsorblock_categories_video: str | None = None
     sponsorblock_categories_music: str | None = None
     path_mappings: list[PathMappingOut] | None = None
+    plex_enabled: bool | None = None
+    plex_url: str | None = None
+    plex_token: str | None = None
+    plex_video_section_id: str | None = None
+    plex_music_section_id: str | None = None
+    plex_refresh_debounce_seconds: int | None = None
+    connect_webhook_url: str | None = None
+    connect_on_download: bool | None = None
+    connect_on_failure: bool | None = None
+    connect_on_grab: bool | None = None
     # api_key is regenerated via POST /api/settings/regenerate-api-key only
     api_auth_required: bool | None = None
     authentication_method: str | None = Field(default=None, pattern="^(none|forms)$")
@@ -283,6 +314,7 @@ class HealthOut(BaseModel):
     listen_host: str | None = None
     listen_port: int | None = None
     restart_required: bool = False
+    warnings: list[str] = []
 
 
 class RenameItemOut(BaseModel):
@@ -324,3 +356,4 @@ class DashboardOut(BaseModel):
     queue_size: int
     ytdlp_ok: bool
     ytdlp_version: str | None
+    downloads_paused: bool = False

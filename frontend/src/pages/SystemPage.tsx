@@ -9,7 +9,7 @@ import {
   type SystemStatus,
 } from "../api";
 
-export type SystemSection = "status" | "rootfolders" | "logs";
+export type SystemSection = "status" | "rootfolders" | "logs" | "tasks" | "backup" | "updates";
 
 type SystemPageProps = {
   section?: SystemSection;
@@ -38,6 +38,16 @@ const emptySettings = (): Settings => ({
   sponsorblock_categories_music:
     "music_offtopic,sponsor,selfpromo,interaction,intro,outro",
   path_mappings: [],
+  plex_enabled: false,
+  plex_url: "http://127.0.0.1:32400",
+  plex_token: "",
+  plex_video_section_id: "",
+  plex_music_section_id: "",
+  plex_refresh_debounce_seconds: 45,
+  connect_webhook_url: "",
+  connect_on_download: true,
+  connect_on_failure: true,
+  connect_on_grab: false,
   api_key: "",
   api_auth_required: true,
   authentication_method: "forms",
@@ -103,6 +113,7 @@ export function SystemPage({ section = "status" }: SystemPageProps) {
   if (health && !health.ytdlp_ok) issues.push(health.ytdlp_error || "yt-dlp unavailable");
   if (health && !health.library_exists) issues.push("Library folder missing");
   if (settings.downloads_paused) issues.push("Downloads paused");
+  for (const w of health?.warnings || []) issues.push(w);
 
   const saveRoots = async (e: FormEvent) => {
     e.preventDefault();
@@ -346,13 +357,15 @@ export function SystemPage({ section = "status" }: SystemPageProps) {
         <div className="panel">
           <h3 style={{ marginTop: 0 }}>Plex naming</h3>
           <p className="muted" style={{ marginBottom: "0.5rem" }}>
-            Video (Personal Media / Local Assets):
+            Video (Home Videos / Local Assets):
           </p>
           <pre className="mono" style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: "0.8rem" }}>
             {`LibraryRoot/
   Channel Name/
     poster.jpg
-    YYYY-MM-DD - Episode Title [youtubeId].ext`}
+    Season 01/
+      Channel Name - S01E01 - Episode Title [youtubeId].ext
+      Channel Name - S01E01 - Episode Title [youtubeId].nfo`}
           </pre>
           <p className="muted" style={{ marginBottom: "0.5rem", marginTop: "0.75rem" }}>
             Music (organized automatically on download):
@@ -363,16 +376,26 @@ export function SystemPage({ section = "status" }: SystemPageProps) {
     Track Title.ext`}
           </pre>
           <p className="muted" style={{ marginBottom: 0, marginTop: "0.75rem" }}>
-            Music files get MusicBrainz tags embedded when a match is found (Plex reads tags, not
-            bracket IDs in the name). YouTube ids stay in ytarr&apos;s database — and in a comment
-            tag — so they do not confuse Plex agents. Video still uses{" "}
-            <span className="mono">[youtubeId]</span> for uniqueness under Personal Media (that is
+            Nested playlists become Season 02+ under the same channel folder. Music files get
+            MusicBrainz tags embedded when a match is found. YouTube ids stay in ytarr&apos;s
+            database — and in video filenames as{" "}
+            <span className="mono">[youtubeId]</span> for uniqueness under Home Videos (that is
             not a TVDB id). Missing upload dates no longer become{" "}
             <span className="mono">0000-00-00</span>.
           </p>
         </div>
       </>
     );
+  }
+
+  if (section === "tasks") {
+    return <SystemTasksPanel />;
+  }
+  if (section === "backup") {
+    return <SystemBackupPanel />;
+  }
+  if (section === "updates") {
+    return <SystemUpdatesPanel />;
   }
 
   return (
@@ -507,6 +530,252 @@ export function SystemPage({ section = "status" }: SystemPageProps) {
           {settings.downloads_paused ? "Paused" : "Running"}
           {` · ${settings.concurrent_downloads} concurrent · poll every ${settings.poll_interval_minutes}m`}
         </p>
+      </div>
+    </>
+  );
+}
+
+function SystemTasksPanel() {
+  const [tasks, setTasks] = useState<
+    { id: string; name: string; next_run_time: string | null; trigger: string }[]
+  >([]);
+  const [error, setError] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+
+  const load = async () => {
+    const res = await api.systemTasks();
+    setTasks(res.tasks);
+  };
+
+  useEffect(() => {
+    void load().catch((err) => setError(err instanceof Error ? err.message : String(err)));
+    const id = window.setInterval(() => void load().catch(() => undefined), 15000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  return (
+    <>
+      <div className="page-header">
+        <div>
+          <h1>Tasks</h1>
+          <p>Scheduled jobs — monitor, downloads, yt-dlp/ffmpeg update.</p>
+        </div>
+      </div>
+      {error && <div className="error">{error}</div>}
+      {message && <div className="success">{message}</div>}
+      <div className="panel table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Task</th>
+              <th>Trigger</th>
+              <th>Next run</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {tasks.map((t) => (
+              <tr key={t.id}>
+                <td>{t.name}</td>
+                <td className="mono muted">{t.trigger}</td>
+                <td className="mono muted">
+                  {t.next_run_time ? new Date(t.next_run_time).toLocaleString() : "—"}
+                </td>
+                <td>
+                  <button
+                    className="btn"
+                    type="button"
+                    disabled={busyId === t.id}
+                    onClick={() => {
+                      setBusyId(t.id);
+                      setMessage(null);
+                      void api
+                        .runSystemTask(t.id)
+                        .then(() => {
+                          setMessage(`Ran ${t.name}.`);
+                          return load();
+                        })
+                        .catch((err) =>
+                          setError(err instanceof Error ? err.message : String(err)),
+                        )
+                        .finally(() => setBusyId(null));
+                    }}
+                  >
+                    Run
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
+function SystemBackupPanel() {
+  const [backups, setBackups] = useState<
+    { name: string; path: string; size: number; mtime: string }[]
+  >([]);
+  const [error, setError] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = async () => {
+    const res = await api.listBackups();
+    setBackups(res.backups);
+  };
+
+  useEffect(() => {
+    void load().catch((err) => setError(err instanceof Error ? err.message : String(err)));
+  }, []);
+
+  return (
+    <>
+      <div className="page-header">
+        <div>
+          <h1>Backup</h1>
+          <p>Zip config.yaml + database under data/backups (Arr-style).</p>
+        </div>
+        <button
+          className="btn btn-primary"
+          type="button"
+          disabled={busy}
+          onClick={() => {
+            setBusy(true);
+            setError(null);
+            void api
+              .createBackup()
+              .then((r) => {
+                setMessage(`Created ${r.name} (${Math.round(r.size / 1024)} KB).`);
+                return load();
+              })
+              .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+              .finally(() => setBusy(false));
+          }}
+        >
+          Backup now
+        </button>
+      </div>
+      {error && <div className="error">{error}</div>}
+      {message && <div className="success">{message}</div>}
+      <div className="panel table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Size</th>
+              <th>When</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {backups.map((b) => (
+              <tr key={b.name}>
+                <td className="mono">{b.name}</td>
+                <td>{Math.round(b.size / 1024)} KB</td>
+                <td className="mono muted">{new Date(b.mtime).toLocaleString()}</td>
+                <td>
+                  <button
+                    className="btn"
+                    type="button"
+                    disabled={busy}
+                    onClick={() => {
+                      if (
+                        !window.confirm(
+                          `Restore ${b.name}? This overwrites config/DB — restart ytarr after.`,
+                        )
+                      ) {
+                        return;
+                      }
+                      setBusy(true);
+                      void api
+                        .restoreBackup(b.name)
+                        .then((r) =>
+                          setMessage(
+                            `Restored ${r.restored.join(", ")}. Restart ytarr to apply.`,
+                          ),
+                        )
+                        .catch((err) =>
+                          setError(err instanceof Error ? err.message : String(err)),
+                        )
+                        .finally(() => setBusy(false));
+                    }}
+                  >
+                    Restore
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {!backups.length && <p className="muted">No backups yet.</p>}
+      </div>
+    </>
+  );
+}
+
+function SystemUpdatesPanel() {
+  const [info, setInfo] = useState<{
+    app_version: string;
+    ytdlp_ok: boolean;
+    ytdlp_version: string | null;
+    ytdlp_error: string | null;
+    note?: string;
+  } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = async () => {
+    setInfo(await api.systemUpdates());
+  };
+
+  useEffect(() => {
+    void load().catch((err) => setError(err instanceof Error ? err.message : String(err)));
+  }, []);
+
+  return (
+    <>
+      <div className="page-header">
+        <div>
+          <h1>Updates</h1>
+          <p>App and yt-dlp / ffmpeg tooling.</p>
+        </div>
+        <button
+          className="btn btn-primary"
+          type="button"
+          disabled={busy}
+          onClick={() => {
+            setBusy(true);
+            setError(null);
+            void api
+              .triggerYtdlpUpdate()
+              .then((r) => {
+                setMessage(`Update: ${JSON.stringify(r)}`);
+                return load();
+              })
+              .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+              .finally(() => setBusy(false));
+          }}
+        >
+          Run yt-dlp / ffmpeg update
+        </button>
+      </div>
+      {error && <div className="error">{error}</div>}
+      {message && <div className="success">{message}</div>}
+      <div className="panel">
+        <p>
+          ytarr version: <span className="mono">{info?.app_version || "—"}</span>
+        </p>
+        <p>
+          yt-dlp:{" "}
+          <span className="mono">
+            {info?.ytdlp_ok ? info.ytdlp_version || "OK" : info?.ytdlp_error || "—"}
+          </span>
+        </p>
+        <p className="muted">{info?.note}</p>
       </div>
     </>
   );

@@ -6,12 +6,17 @@ export type Source = {
   source_type: string;
   enabled: boolean;
   monitor_mode: string;
+  /** YouTube About text. null = not looked up yet, "" = channel has none. */
+  description?: string | null;
+  subscriber_count?: number | null;
   quality: string;
   media_type: string;
   folder_name: string;
   poster_path: string | null;
   fanart_path: string | null;
   parent_source_id?: number | null;
+  tags?: string;
+  season_number?: number;
   last_checked: string | null;
   initialized: boolean;
   created_at: string;
@@ -61,6 +66,7 @@ export type Dashboard = {
   queue_size: number;
   ytdlp_ok: boolean;
   ytdlp_version: string | null;
+  downloads_paused?: boolean;
 };
 
 export type PathMapping = {
@@ -76,6 +82,8 @@ export type Settings = {
   music_library_root: string;
   ytdlp_path: string;
   ffmpeg_path?: string;
+  ytdlp_cookies_path?: string;
+  ytdlp_cookies_from_browser?: string;
   default_quality: string;
   default_music_quality: string;
   format: string;
@@ -90,6 +98,16 @@ export type Settings = {
   sponsorblock_categories_video: string;
   sponsorblock_categories_music: string;
   path_mappings: PathMapping[];
+  plex_enabled?: boolean;
+  plex_url?: string;
+  plex_token?: string;
+  plex_video_section_id?: string;
+  plex_music_section_id?: string;
+  plex_refresh_debounce_seconds?: number;
+  connect_webhook_url?: string;
+  connect_on_download?: boolean;
+  connect_on_failure?: boolean;
+  connect_on_grab?: boolean;
   api_key: string;
   api_auth_required: boolean;
   authentication_method: "none" | "forms";
@@ -195,6 +213,12 @@ export type Health = {
   ytdlp_error: string | null;
   library_root: string;
   library_exists: boolean;
+  config_path?: string;
+  configured_host?: string;
+  listen_host?: string | null;
+  listen_port?: number | null;
+  restart_required?: boolean;
+  warnings?: string[];
 };
 
 declare global {
@@ -301,6 +325,7 @@ export const api = {
   regenerateApiKey: () =>
     request<Settings>("/api/settings/regenerate-api-key", { method: "POST" }),
   sources: () => request<Source[]>("/api/sources"),
+  source: (id: number) => request<Source>(`/api/sources/${id}`),
   search: (q: string, kind: "channel" | "playlist" | "video" = "channel", limit = 12) => {
     const params = new URLSearchParams({
       q,
@@ -367,6 +392,7 @@ export const api = {
       monitor_mode?: string;
       quality?: string;
       media_type?: string;
+      tags?: string;
     },
   ) =>
     request<Source>(`/api/sources/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
@@ -381,6 +407,8 @@ export const api = {
   },
   checkSource: (id: number) =>
     request<Record<string, unknown>>(`/api/sources/${id}/check`, { method: "POST" }),
+  refreshSourceMetadata: (id: number) =>
+    request<Source>(`/api/sources/${id}/refresh-metadata`, { method: "POST" }),
   checkAllSources: () =>
     request<{ ok: boolean; checked: number; results: Record<string, unknown>[] }>(
       "/api/sources/check-all",
@@ -459,5 +487,128 @@ export const api = {
     request<RenameApplyResult>("/api/rename/apply", {
       method: "POST",
       body: JSON.stringify(body),
+    }),
+  plexSections: () =>
+    request<{ sections: { id: string; title: string; type: string; locations: string[] }[] }>(
+      "/api/connect/plex/sections",
+    ),
+  plexTest: () =>
+    request<{
+      ok: boolean;
+      error?: string;
+      section_count?: number;
+      sections?: { id: string; title: string; type: string }[];
+    }>("/api/connect/plex/test", { method: "POST" }),
+  plexRefresh: (mediaType: "video" | "audio" = "video") =>
+    request<Record<string, unknown>>(
+      `/api/connect/plex/refresh?media_type=${encodeURIComponent(mediaType)}`,
+      { method: "POST" },
+    ),
+  systemTasks: () =>
+    request<{ tasks: { id: string; name: string; next_run_time: string | null; trigger: string }[] }>(
+      "/api/system/tasks",
+    ),
+  runSystemTask: (taskId: string) =>
+    request<Record<string, unknown>>(`/api/system/tasks/${encodeURIComponent(taskId)}/run`, {
+      method: "POST",
+    }),
+  listBackups: () =>
+    request<{ backups: { name: string; path: string; size: number; mtime: string }[] }>(
+      "/api/system/backup",
+    ),
+  createBackup: () =>
+    request<{ ok: boolean; path: string; name: string; size: number }>("/api/system/backup", {
+      method: "POST",
+    }),
+  restoreBackup: (name: string) =>
+    request<{ ok: boolean; restored: string[]; restart_required?: boolean }>(
+      `/api/system/backup/restore?name=${encodeURIComponent(name)}`,
+      { method: "POST" },
+    ),
+  systemUpdates: () =>
+    request<{
+      app_version: string;
+      ytdlp_ok: boolean;
+      ytdlp_version: string | null;
+      ytdlp_error: string | null;
+      note?: string;
+    }>("/api/system/updates"),
+  triggerYtdlpUpdate: () =>
+    request<Record<string, unknown>>("/api/system/updates/ytdlp", { method: "POST" }),
+  calendar: (start?: string, end?: string) => {
+    const q = new URLSearchParams();
+    if (start) q.set("start", start);
+    if (end) q.set("end", end);
+    const qs = q.toString();
+    return request<{
+      events: {
+        id: number;
+        title: string;
+        video_id: string;
+        status: string;
+        published_at: string | null;
+        source_id: number;
+        source_title: string | null;
+      }[];
+      start: string;
+      end: string;
+    }>(`/api/calendar${qs ? `?${qs}` : ""}`);
+  },
+  blocklist: (limit = 200) =>
+    request<{
+      items: {
+        id: number;
+        title: string;
+        video_id: string;
+        error: string | null;
+        source_id: number;
+        source_title: string | null;
+        updated_at: string | null;
+      }[];
+    }>(`/api/blocklist?limit=${limit}`),
+  unblock: (videoId: number) =>
+    request<{ ok: boolean }>(`/api/blocklist/${videoId}`, { method: "DELETE" }),
+  importScan: (limit = 200) =>
+    request<{
+      items: { path: string; video_id: string; title: string; already_in_db: boolean }[];
+    }>(`/api/import/scan?limit=${limit}`),
+  importApply: (items: { path: string; video_id: string; title?: string }[], sourceId?: number) =>
+    request<{ imported: number; skipped: number; errors: string[] }>("/api/import/apply", {
+      method: "POST",
+      body: JSON.stringify({ items, source_id: sourceId ?? null }),
+    }),
+  interactiveSearch: (sourceId: number, q?: string, limit = 20) => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (q) params.set("q", q);
+    return request<{
+      query: string;
+      results: (SearchHit & { in_library?: boolean; library_status?: string })[];
+    }>(`/api/sources/${sourceId}/interactive-search?${params}`);
+  },
+  interactiveGrab: (
+    sourceId: number,
+    body: { video_id: string; title?: string; url?: string },
+  ) =>
+    request<{
+      ok: boolean;
+      created?: boolean;
+      already?: boolean;
+      video_id: number;
+      youtube_id?: string;
+      status: string;
+      message: string;
+    }>(`/api/sources/${sourceId}/interactive-search/grab`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  tags: () => request<{ tags: string[]; counts?: Record<string, number> }>("/api/tags"),
+  renameTag: (from: string, to: string) =>
+    request<{ ok: boolean; updated: number }>("/api/tags/rename", {
+      method: "POST",
+      body: JSON.stringify({ from, to }),
+    }),
+  deleteTag: (tag: string) =>
+    request<{ ok: boolean; updated: number }>(`/api/tags/${encodeURIComponent(tag)}`, {
+      method: "DELETE",
     }),
 };

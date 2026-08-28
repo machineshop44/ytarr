@@ -12,27 +12,49 @@ export function LibraryPage({ defaultStatus = "wanted" }: LibraryPageProps) {
   const [videos, setVideos] = useState<Video[]>([]);
   const [status, setStatus] = useState(statusFromQuery || defaultStatus);
   const [error, setError] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
   const [busyAll, setBusyAll] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    setStatus(statusFromQuery || defaultStatus);
+  }, [defaultStatus, statusFromQuery]);
 
   const load = async (nextStatus = status) => {
     setVideos(await api.videos(nextStatus === "all" ? undefined : { status: nextStatus }));
   };
 
   useEffect(() => {
-    setStatus(statusFromQuery || defaultStatus);
-  }, [defaultStatus, statusFromQuery]);
-
-  useEffect(() => {
-    void load().catch((err) => setError(err instanceof Error ? err.message : String(err)));
+    let alive = true;
+    setLoading(true);
+    setVideos([]);
+    void api
+      .videos(status === "all" ? undefined : { status })
+      .then((rows) => {
+        if (!alive) return;
+        setVideos(rows);
+        setError(null);
+      })
+      .catch((err) => {
+        if (alive) setError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (alive) setLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
   }, [status]);
 
   const searchAll = async () => {
     setBusyAll(true);
     setError(null);
+    setMessage(null);
     try {
       await api.processQueue();
       await load();
+      setMessage("Queue processing started.");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -44,10 +66,19 @@ export function LibraryPage({ defaultStatus = "wanted" }: LibraryPageProps) {
     <>
       <div className="page-header">
         <div>
-          <h1>Missing</h1>
+          <h1>
+            {status === "cutoff"
+              ? "Cutoff Unmet"
+              : status === "failed"
+                ? "Failed"
+                : "Wanted"}
+          </h1>
           <p>
-            Wanted / missing videos — Sonarr Wanted for YouTube. Identity is the video id, not the
-            title.
+            {status === "cutoff"
+              ? "Quality-upgrade requeues — change a series Quality to bump downloaded episodes here."
+              : status === "failed"
+                ? "Downloads that failed — retry or ignore."
+              : "Wanted / failed videos — Sonarr Wanted for YouTube. Identity is the video id, not the title."}
           </p>
         </div>
         <div className="row">
@@ -61,6 +92,7 @@ export function LibraryPage({ defaultStatus = "wanted" }: LibraryPageProps) {
             onChange={(e) => setStatus(e.target.value)}
           >
             <option value="wanted">Wanted</option>
+            <option value="cutoff">Cutoff Unmet</option>
             <option value="failed">Failed</option>
             <option value="seen">Seen (not downloaded)</option>
             <option value="ignored">Ignored</option>
@@ -71,6 +103,7 @@ export function LibraryPage({ defaultStatus = "wanted" }: LibraryPageProps) {
       </div>
 
       {error && <div className="error">{error}</div>}
+      {message && <div className="success">{message}</div>}
 
       <div className="panel table-wrap">
         <table>
@@ -128,7 +161,7 @@ export function LibraryPage({ defaultStatus = "wanted" }: LibraryPageProps) {
                             .finally(() => setBusyId(null));
                         }}
                       >
-                        Search
+                        Retry
                       </button>
                     )}
                     {video.status !== "ignored" && video.status !== "downloaded" && (
@@ -147,7 +180,7 @@ export function LibraryPage({ defaultStatus = "wanted" }: LibraryPageProps) {
                             .finally(() => setBusyId(null));
                         }}
                       >
-                        Unmonitor
+                        Ignore
                       </button>
                     )}
                   </div>
@@ -156,7 +189,8 @@ export function LibraryPage({ defaultStatus = "wanted" }: LibraryPageProps) {
             ))}
           </tbody>
         </table>
-        {!videos.length && <p className="muted">No videos in this view.</p>}
+        {loading && <p className="muted">Loading…</p>}
+        {!loading && !videos.length && <p className="muted">No videos in this view.</p>}
       </div>
     </>
   );

@@ -92,8 +92,9 @@ export function SourcesPage() {
         <div>
           <h1>Sources</h1>
           <p>
-            Power tools for monitored URLs. Day-to-day browsing lives on the{" "}
-            <Link to="/">Library</Link>.
+            Add or manage monitored URLs. For day-to-day browsing use the{" "}
+            <Link to="/">Library</Link>; to import orphan files from disk use{" "}
+            <Link to="/import">Manual Import</Link>.
           </p>
         </div>
         <Link className="btn btn-primary" to="/add">

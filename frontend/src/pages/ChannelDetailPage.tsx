@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   api,
   type DownloadJob,
+  type PlaylistEntryPreview,
   type RenameItem,
   type SearchHit,
   type Source,
@@ -24,6 +25,12 @@ async function kickQueue() {
   void api.processQueue().catch(() => undefined);
 }
 
+function formatCompact(n: number): string {
+  return new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(
+    n,
+  );
+}
+
 export function ChannelDetailPage() {
   const { sourceId } = useParams();
   const navigate = useNavigate();
@@ -34,6 +41,12 @@ export function ChannelDetailPage() {
   const [playlists, setPlaylists] = useState<SearchHit[]>([]);
   const [uploadVideos, setUploadVideos] = useState<Video[]>([]);
   const [albumTracks, setAlbumTracks] = useState<Record<number, Video[]>>({});
+  const [previewEntries, setPreviewEntries] = useState<Record<string, PlaylistEntryPreview[]>>(
+    {},
+  );
+  const [previewLoading, setPreviewLoading] = useState<Record<string, boolean>>({});
+  /** Optimistic picks while selective add/sync is still running. */
+  const [previewPicked, setPreviewPicked] = useState<Record<string, Set<string>>>({});
   const [expandedKeys, setExpandedKeys] = useState<Set<string>>(() => new Set());
   const [loading, setLoading] = useState(true);
   const [loadingPlaylists, setLoadingPlaylists] = useState(false);
@@ -41,12 +54,20 @@ export function ChannelDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [tab, setTab] = useState<SeriesTab>("episodes");
+  const [overviewOpen, setOverviewOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
   const [editTitle, setEditTitle] = useState("");
   const [editEnabled, setEditEnabled] = useState(true);
   const [editMode, setEditMode] = useState("all");
   const [editQuality, setEditQuality] = useState("");
   const [editMediaType, setEditMediaType] = useState("video");
+  const [editTags, setEditTags] = useState("");
+  const [ixOpen, setIxOpen] = useState(false);
+  const [ixQuery, setIxQuery] = useState("");
+  const [ixResults, setIxResults] = useState<
+    { title: string; id: string | null; url: string; in_library?: boolean; library_status?: string }[]
+  >([]);
+  const [ixBusy, setIxBusy] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteFiles, setDeleteFiles] = useState(false);
 
@@ -67,7 +88,7 @@ export function ChannelDetailPage() {
       const existing = findExistingPlaylist(allSources, hit);
       if (existing) ids.add(existing.id);
     }
-    return [...ids];
+    return [...ids].sort((a, b) => a - b);
   }, [source, playlists, allSources]);
 
   /** YouTube ids already covered by a monitored playlist — omit these from Uploads UI. */
@@ -88,17 +109,23 @@ export function ChannelDetailPage() {
     return uploadVideos.filter((v) => !playlistOwnedIds.has(v.video_id));
   }, [uploadVideos, playlistOwnedIds]);
 
-  const loadCore = useCallback(async () => {
+  const loadCore = useCallback(async (opts?: { catalog?: boolean }) => {
     if (!Number.isFinite(id)) throw new Error("Invalid source");
-    const [sources, vids] = await Promise.all([
-      api.sources(),
+    const [found, vids] = await Promise.all([
+      api.source(id),
       api.videos({ source_id: id }),
     ]);
-    const found = sources.find((s) => s.id === id);
-    if (!found) throw new Error("Source not found");
-    setAllSources(sources);
     setSource(found);
     setUploadVideos(vids);
+    let sources: Source[] = [];
+    if (opts?.catalog) {
+      sources = await api.sources();
+      setAllSources(sources);
+    } else {
+      setAllSources((prev) =>
+        prev.map((s) => (s.id === found.id ? { ...s, ...found } : s)),
+      );
+    }
     return { source: found, sources };
   }, [id]);
 
@@ -109,7 +136,7 @@ export function ChannelDetailPage() {
       setLoading(true);
       setError(null);
       try {
-        const { source: found, sources: sourcesNow } = await loadCore();
+        const { source: found } = await loadCore({ catalog: true });
         if (!alive) return;
         if (found.source_type === "channel" && !playlistsLoaded) {
           playlistsLoaded = true;
@@ -118,22 +145,15 @@ export function ChannelDetailPage() {
             const res = await api.channelPlaylists(found.url, 50);
             if (!alive) return;
             setPlaylists(res.results);
-            await Promise.all(
-              res.results.map(async (hit) => {
-                const existing = findExistingPlaylist(sourcesNow, hit);
-                if (!existing) return;
-                try {
-                  const vids = await api.videos({ source_id: existing.id });
-                  if (alive) {
-                    setAlbumTracks((prev) => ({ ...prev, [existing.id]: vids }));
-                  }
-                } catch {
-                  /* ignore */
-                }
-              }),
-            );
           } catch (err) {
-            if (alive) setError(err instanceof Error ? err.message : String(err));
+            // Playlist tree is optional — don't block the series page (e.g. cookie DB errors)
+            if (alive) {
+              setError(
+                `Playlists could not refresh: ${
+                  err instanceof Error ? err.message : String(err)
+                }`,
+              );
+            }
           } finally {
             if (alive) setLoadingPlaylists(false);
           }
@@ -158,7 +178,7 @@ export function ChannelDetailPage() {
     let inFlight = false;
     const ms = source && !source.initialized ? 2000 : 8000;
     const id = window.setInterval(() => {
-      if (inFlight) return;
+      if (inFlight || document.hidden) return;
       inFlight = true;
       void loadCore()
         .catch(() => undefined)
@@ -166,13 +186,18 @@ export function ChannelDetailPage() {
           inFlight = false;
         });
     }, ms);
+    const onVis = () => {
+      if (!document.hidden && !inFlight) void loadCore().catch(() => undefined);
+    };
+    document.addEventListener("visibilitychange", onVis);
     return () => {
       window.clearInterval(id);
+      document.removeEventListener("visibilitychange", onVis);
     };
   }, [loadCore, source?.initialized]);
 
-  const loadHistory = useCallback(async (sourceIds: number[]) => {
-    setHistoryLoading(true);
+  const loadHistory = useCallback(async (sourceIds: number[], opts?: { quiet?: boolean }) => {
+    if (!opts?.quiet) setHistoryLoading(true);
     try {
       const batches = await Promise.all(
         sourceIds.map((sid) =>
@@ -189,9 +214,9 @@ export function ChannelDetailPage() {
       const list = [...merged.values()].sort((a, b) => b.id - a.id);
       setHistoryJobs(list);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (!opts?.quiet) setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setHistoryLoading(false);
+      if (!opts?.quiet) setHistoryLoading(false);
     }
   }, []);
 
@@ -211,16 +236,47 @@ export function ChannelDetailPage() {
     }
   }, []);
 
-  // Prefetch rename preview for this series (tab badge + Preview Rename toolbar)
+  // Sources added before we stored the About text have description null — backfill once.
+  const needsMetadata = Boolean(source) && source?.description == null;
   useEffect(() => {
-    if (!relatedSourceIds.length) return;
+    if (!needsMetadata || !Number.isFinite(id)) return;
+    let cancelled = false;
+    void api
+      .refreshSourceMetadata(id)
+      .then((updated) => {
+        if (!cancelled) setSource(updated);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [id, needsMetadata]);
+
+  // Rename preview is expensive on large libraries — only when the Rename tab is open
+  useEffect(() => {
+    if (tab !== "rename" || !relatedSourceIds.length) return;
     void loadRename(relatedSourceIds, { quiet: true });
-  }, [relatedSourceIds, loadRename]);
+  }, [tab, relatedSourceIds, loadRename]);
+
+  const relatedKey = relatedSourceIds.join(",");
 
   useEffect(() => {
-    if (!relatedSourceIds.length) return;
-    if (tab === "history") void loadHistory(relatedSourceIds);
-  }, [tab, relatedSourceIds, loadHistory]);
+    if (!relatedKey || tab !== "history") return;
+    const ids = relatedKey.split(",").map(Number);
+    void loadHistory(ids);
+    const timer = window.setInterval(() => {
+      if (document.hidden) return;
+      void loadHistory(ids, { quiet: true });
+    }, 4000);
+    const onVis = () => {
+      if (!document.hidden) void loadHistory(ids, { quiet: true });
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, [tab, relatedKey, loadHistory]);
 
   const loadAlbumTracks = async (sourceId: number, opts?: { refresh?: boolean }) => {
     if (opts?.refresh) {
@@ -256,7 +312,20 @@ export function ChannelDetailPage() {
     }
   };
 
-  const toggleExpand = async (key: string, playlistSource?: Source) => {
+  const loadPlaylistPreview = async (key: string, url: string) => {
+    setPreviewLoading((prev) => ({ ...prev, [key]: true }));
+    try {
+      const res = await api.playlistEntries(url, 100);
+      setPreviewEntries((prev) => ({ ...prev, [key]: res.entries }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setPreviewEntries((prev) => ({ ...prev, [key]: prev[key] || [] }));
+    } finally {
+      setPreviewLoading((prev) => ({ ...prev, [key]: false }));
+    }
+  };
+
+  const toggleExpand = async (key: string, playlistSource?: Source, previewUrl?: string) => {
     const willExpand = !expandedKeys.has(key);
     setExpandedKeys((prev) => {
       const next = new Set(prev);
@@ -278,6 +347,10 @@ export function ChannelDetailPage() {
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
       }
+    } else if (willExpand && previewUrl) {
+      if (previewEntries[key] == null && !previewLoading[key]) {
+        await loadPlaylistPreview(key, previewUrl);
+      }
     } else if (willExpand && (key === "uploads" || key === "self") && !uploadVideos.length) {
       // Structure-only channels used to skip Uploads enumeration — pull catalog on expand
       await refreshUploadsCatalog();
@@ -289,9 +362,16 @@ export function ChannelDetailPage() {
     setExpandedKeys(new Set(keys));
     for (const hit of playlists) {
       const existing = findExistingPlaylist(allSources, hit);
+      const key = hit.id || hit.url;
       if (existing && albumTracks[existing.id] == null) {
         try {
           await loadAlbumTracks(existing.id);
+        } catch {
+          /* ignore */
+        }
+      } else if (!existing && previewEntries[key] == null) {
+        try {
+          await loadPlaylistPreview(key, hit.url);
         } catch {
           /* ignore */
         }
@@ -369,6 +449,7 @@ export function ChannelDetailPage() {
     setEditMode(source.monitor_mode === "video" ? "all" : source.monitor_mode);
     setEditQuality(source.quality || "");
     setEditMediaType(source.media_type || "video");
+    setEditTags(source.tags || "");
     setEditOpen(true);
   };
 
@@ -383,6 +464,7 @@ export function ChannelDetailPage() {
         monitor_mode: editMode,
         quality: editQuality,
         media_type: editMediaType,
+        tags: editTags,
       });
       setSource(updated);
       setEditOpen(false);
@@ -391,6 +473,50 @@ export function ChannelDetailPage() {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusyKey(null);
+    }
+  };
+
+  const runInteractiveSearch = async () => {
+    if (!source) return;
+    setIxBusy(true);
+    setError(null);
+    try {
+      const res = await api.interactiveSearch(source.id, ixQuery || source.title);
+      setIxResults(res.results);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIxBusy(false);
+    }
+  };
+
+  const grabInteractiveResult = async (r: {
+    id?: string | null;
+    title: string;
+    url: string;
+  }) => {
+    if (!source || !r.id) return;
+    setIxBusy(true);
+    setError(null);
+    try {
+      const res = await api.interactiveGrab(source.id, {
+        video_id: r.id,
+        title: r.title,
+        url: r.url,
+      });
+      setMessage(res.message || "Queued.");
+      setIxResults((prev) =>
+        prev.map((row) =>
+          row.id === r.id
+            ? { ...row, in_library: true, library_status: res.status || "wanted" }
+            : row,
+        ),
+      );
+      await loadCore();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIxBusy(false);
     }
   };
 
@@ -484,7 +610,7 @@ export function ChannelDetailPage() {
         if (
           !window.confirm(
             `Add “${hit.title}” and download the FULL playlist now?\n\n` +
-              `Cancel and use Add New → expand the playlist to pick individual episodes instead.`,
+              `Cancel and expand the playlist to pick individual episodes instead.`,
           )
         ) {
           return;
@@ -532,6 +658,62 @@ export function ChannelDetailPage() {
     }
   };
 
+  const downloadPreviewEpisode = async (hit: SearchHit, entry: PlaylistEntryPreview) => {
+    if (!source) return;
+    const key = hit.id || hit.url;
+    setBusyKey(`preview-${entry.video_id}`);
+    setError(null);
+    setMessage(null);
+    try {
+      const existing = findExistingPlaylist(allSources, hit);
+      const wantedIds = new Set<string>([entry.video_id]);
+      if (existing) {
+        let tracks = albumTracks[existing.id];
+        if (tracks == null) tracks = await loadAlbumTracks(existing.id);
+        for (const v of tracks || []) {
+          if (trackIsMonitored(v.status)) wantedIds.add(v.video_id);
+        }
+      }
+      setPreviewPicked((prev) => {
+        const next = { ...prev };
+        const set = new Set(next[key] || []);
+        set.add(entry.video_id);
+        next[key] = set;
+        return next;
+      });
+      const created = await api.addSource(hit.url, "all", {
+        wanted_video_ids: [...wantedIds],
+        quality: source.quality || "",
+        media_type: (source.media_type as "video" | "audio") || "video",
+        title: hit.title,
+        yt_id: hit.id,
+        thumbnail_url: hit.thumbnail_url,
+        parent_source_id: source.id,
+      });
+      await kickQueue();
+      setMessage(`Queued “${entry.title}” for download.`);
+      await loadCore();
+      // Selective add already syncs in the background — poll the DB, don't re-checkSource.
+      for (let i = 0; i < 10; i++) {
+        const vids = await loadAlbumTracks(created.id);
+        if (vids.some((v) => v.video_id === entry.video_id)) break;
+        await new Promise((r) => setTimeout(r, 700));
+      }
+      setExpandedKeys((prev) => new Set(prev).add(key));
+    } catch (err) {
+      setPreviewPicked((prev) => {
+        const next = { ...prev };
+        const set = new Set(next[key] || []);
+        set.delete(entry.video_id);
+        next[key] = set;
+        return next;
+      });
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
   const renderTracks = (vids: Video[]) => {
     if (!vids.length) {
       return <p className="muted track-empty">No episodes yet — refresh or monitor this season.</p>;
@@ -551,6 +733,55 @@ export function ChannelDetailPage() {
           />
         ))}
       </EpisodeTable>
+    );
+  };
+
+  const renderPreviewEntries = (
+    hit: SearchHit,
+    key: string,
+    entries: PlaylistEntryPreview[] | undefined,
+  ) => {
+    if (previewLoading[key]) {
+      return <p className="muted track-empty">Loading episodes…</p>;
+    }
+    if (!entries) {
+      return <p className="muted track-empty">Loading episodes…</p>;
+    }
+    if (!entries.length) {
+      return <p className="muted track-empty">No videos found in this playlist.</p>;
+    }
+    const sorted = [...entries].sort((a, b) => {
+      const ta = a.published_at ? Date.parse(a.published_at) : NaN;
+      const tb = b.published_at ? Date.parse(b.published_at) : NaN;
+      if (!Number.isNaN(ta) && !Number.isNaN(tb)) return tb - ta;
+      if (!Number.isNaN(ta)) return -1;
+      if (!Number.isNaN(tb)) return 1;
+      return 0;
+    });
+    const picked = previewPicked[key] || new Set<string>();
+    return (
+      <>
+        <p className="muted track-empty" style={{ marginBottom: "0.5rem" }}>
+          Tick an episode to download it, or monitor the playlist for all.
+        </p>
+        <EpisodeTable>
+          {sorted.map((e, i) => (
+            <TrackMonitorRow
+              key={e.video_id}
+              index={sorted.length - i}
+              title={e.title}
+              status={picked.has(e.video_id) ? "wanted" : "available"}
+              published={e.published_at ? new Date(e.published_at).toLocaleDateString() : null}
+              checked={picked.has(e.video_id)}
+              busy={busyKey === `preview-${e.video_id}`}
+              onToggle={() => {
+                if (picked.has(e.video_id)) return;
+                void downloadPreviewEpisode(hit, e);
+              }}
+            />
+          ))}
+        </EpisodeTable>
+      </>
     );
   };
 
@@ -595,6 +826,16 @@ export function ChannelDetailPage() {
   }
 
   const isChannel = source.source_type === "channel";
+  const kindLabel =
+    source.media_type === "audio"
+      ? source.source_type === "video"
+        ? "Song"
+        : "Music"
+      : source.source_type === "video"
+        ? "Video"
+        : source.source_type === "playlist"
+          ? "Playlist"
+          : "Channel";
   const modeLabel =
     source.monitor_mode === "all"
       ? "All"
@@ -603,6 +844,13 @@ export function ChannelDetailPage() {
         : source.monitor_mode === "none"
           ? "None"
           : "Video";
+  const overview = (source.description || "").trim();
+  const subscriberLabel = source.subscriber_count
+    ? `${formatCompact(source.subscriber_count)} subscribers`
+    : null;
+  const lastCheckedLabel = source.last_checked
+    ? `Checked ${new Date(source.last_checked).toLocaleString()}`
+    : "Never checked";
   const seasonKeys = isChannel
     ? [...playlists.map((h) => h.id || h.url), "uploads"]
     : ["self"];
@@ -630,10 +878,31 @@ export function ChannelDetailPage() {
           type="button"
           disabled={busyKey === "search" || source.monitor_mode === "video"}
           onClick={onSearchAll}
-          title="Queue missing downloads"
+          title={
+            source.monitor_mode === "video"
+              ? "One-shot videos have nothing left to search"
+              : "Queue missing downloads"
+          }
         >
           Search Monitored
         </button>
+        <button
+          className="btn"
+          type="button"
+          onClick={() => {
+            setIxQuery(source.title);
+            setIxOpen(true);
+            setIxResults([]);
+          }}
+          title="Interactive Search — find related YouTube videos"
+        >
+          Interactive Search
+        </button>
+        {source.monitor_mode === "video" && (
+          <span className="muted" style={{ fontSize: "0.82rem", alignSelf: "center" }}>
+            One-shot — Search Monitored not available
+          </span>
+        )}
         <button
           className="btn"
           type="button"
@@ -650,15 +919,7 @@ export function ChannelDetailPage() {
         >
           History
         </button>
-        <button
-          className="btn"
-          type="button"
-          onClick={openEdit}
-          title="Series monitoring & quality"
-        >
-          Series Monitoring
-        </button>
-        <button className="btn" type="button" onClick={openEdit} title="Edit series">
+        <button className="btn" type="button" onClick={openEdit} title="Edit monitoring & quality">
           Edit
         </button>
         <button
@@ -695,7 +956,13 @@ export function ChannelDetailPage() {
           <div className="channel-hero-body">
             <h1 className="series-hero-title">{source.title}</h1>
             <div className="series-hero-meta muted">
-              <span>{isChannel ? "Channel" : "Playlist"}</span>
+              <span>{kindLabel}</span>
+              {subscriberLabel && (
+                <>
+                  <span>·</span>
+                  <span>{subscriberLabel}</span>
+                </>
+              )}
               <span>·</span>
               <span>
                 {source.downloaded_count}/{source.video_count || "—"} on disk
@@ -706,6 +973,17 @@ export function ChannelDetailPage() {
                   <span>{source.wanted_count} wanted</span>
                 </>
               )}
+              {isChannel && (source.nested_playlist_count || 0) > 0 && (
+                <>
+                  <span>·</span>
+                  <span>
+                    {source.nested_playlist_count}{" "}
+                    {source.nested_playlist_count === 1 ? "playlist" : "playlists"}
+                  </span>
+                </>
+              )}
+              <span>·</span>
+              <span>{lastCheckedLabel}</span>
             </div>
             <div className="series-info-labels">
               <span className="info-label mono" title={source.folder_name}>
@@ -718,11 +996,30 @@ export function ChannelDetailPage() {
               <span className="info-label">{source.media_type === "audio" ? "Music" : "Video"}</span>
               <span className="info-label">Monitor: {modeLabel}</span>
             </div>
-            <p className="series-hero-blurb muted">
-              {isChannel
-                ? "Playlists first, Uploads last. Monitor seasons from here anytime — or pick episodes in Add New."
-                : "Episodes in this playlist."}
-            </p>
+            {overview ? (
+              <>
+                <p
+                  className={`series-hero-blurb muted${overviewOpen ? "" : " series-hero-blurb-clamp"}`}
+                >
+                  {overview}
+                </p>
+                {overview.length > 320 && (
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-tiny"
+                    onClick={() => setOverviewOpen((v) => !v)}
+                  >
+                    {overviewOpen ? "Show less" : "Show more"}
+                  </button>
+                )}
+              </>
+            ) : (
+              <p className="series-hero-blurb muted">
+                {source.description == null
+                  ? "Loading channel details from YouTube…"
+                  : `No description on YouTube for this ${isChannel ? "channel" : "playlist"}.`}
+              </p>
+            )}
           </div>
         </div>
       </section>
@@ -781,9 +1078,15 @@ export function ChannelDetailPage() {
                 const existing = findExistingPlaylist(allSources, hit);
                 const key = hit.id || hit.url;
                 const monitored = Boolean(existing?.enabled);
-                const tracks = existing ? albumTracks[existing.id] || [] : [];
+                const tracks = existing ? albumTracks[existing.id] : undefined;
                 const downloaded = existing?.downloaded_count ?? 0;
-                const total = existing?.video_count || hit.video_count || tracks.length;
+                const preview = previewEntries[key];
+                const total =
+                  existing?.video_count ||
+                  hit.video_count ||
+                  tracks?.length ||
+                  preview?.length ||
+                  0;
                 return (
                   <AlbumMonitorRow
                     key={key}
@@ -792,27 +1095,16 @@ export function ChannelDetailPage() {
                     total={total || 0}
                     detail={albumSubtitle(hit, existing)}
                     monitored={monitored}
-                    busy={busyKey === hit.url}
+                    busy={busyKey === hit.url || Boolean(previewLoading[key])}
                     expanded={expandedKeys.has(key)}
                     onToggleMonitor={() => void togglePlaylistMonitor(hit, existing)}
                     onToggleExpand={() => {
-                      if (existing) void toggleExpand(key, existing);
-                      else
-                        setExpandedKeys((prev) => {
-                          const next = new Set(prev);
-                          if (next.has(key)) next.delete(key);
-                          else next.add(key);
-                          return next;
-                        });
+                      void toggleExpand(key, existing || undefined, hit.url);
                     }}
                   >
-                    {existing ? (
-                      renderTracks(tracks)
-                    ) : (
-                      <p className="muted track-empty">
-                        Monitor this playlist to download its episodes (or pick them in Add New).
-                      </p>
-                    )}
+                    {existing && tracks != null
+                      ? renderTracks(tracks)
+                      : renderPreviewEntries(hit, key, preview)}
                   </AlbumMonitorRow>
                 );
               })}
@@ -921,7 +1213,7 @@ export function ChannelDetailPage() {
               <span className="mono">
                 {source.media_type === "audio"
                   ? "Artist / Title.ext (MusicBrainz tags)"
-                  : "Channel / YYYY-MM-DD - Title [youtubeId].ext"}
+                  : "Channel / Season XX / Show - SxxExx - Title [youtubeId].ext"}
               </span>
             </p>
             <div className="row">
@@ -1091,6 +1383,18 @@ export function ChannelDetailPage() {
                   <small>Include this series in automatic checks.</small>
                 </span>
               </label>
+              <div className="field">
+                <label htmlFor="edit-tags">Tags</label>
+                <input
+                  id="edit-tags"
+                  value={editTags}
+                  onChange={(e) => setEditTags(e.target.value)}
+                  placeholder="cars, music, family"
+                />
+                <p className="muted" style={{ margin: "0.35rem 0 0", fontSize: "0.82rem" }}>
+                  Comma-separated labels for library filters.
+                </p>
+              </div>
               <p className="muted" style={{ marginTop: "0.85rem", marginBottom: 0 }}>
                 Path folder: <span className="mono">{source.folder_name}</span>
               </p>
@@ -1107,6 +1411,81 @@ export function ChannelDetailPage() {
               >
                 Save
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {ixOpen && source && (
+        <div className="modal-backdrop" role="presentation" onClick={() => setIxOpen(false)}>
+          <div
+            className="modal"
+            role="dialog"
+            onClick={(e) => e.stopPropagation()}
+            style={{ maxWidth: 720 }}
+          >
+            <div className="modal-header">
+              <h2>Interactive Search</h2>
+              <button className="btn" type="button" onClick={() => setIxOpen(false)}>
+                Close
+              </button>
+            </div>
+            <div className="modal-body">
+              <div className="row" style={{ gap: "0.5rem", marginBottom: "0.75rem" }}>
+                <input
+                  style={{ flex: 1 }}
+                  value={ixQuery}
+                  onChange={(e) => setIxQuery(e.target.value)}
+                  placeholder="Search query"
+                />
+                <button
+                  className="btn btn-primary"
+                  type="button"
+                  disabled={ixBusy}
+                  onClick={() => void runInteractiveSearch()}
+                >
+                  Search
+                </button>
+              </div>
+              {!ixResults.length && !ixBusy && (
+                <p className="muted">Run a search to see YouTube results for this series.</p>
+              )}
+              <ul style={{ margin: 0, paddingLeft: "1.1rem", listStyle: "none" }}>
+                {ixResults.map((r) => (
+                  <li
+                    key={r.id || r.url}
+                    style={{
+                      marginBottom: "0.55rem",
+                      display: "flex",
+                      gap: "0.5rem",
+                      alignItems: "center",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <a href={r.url} target="_blank" rel="noreferrer" style={{ flex: 1, minWidth: 0 }}>
+                      {r.title}
+                    </a>
+                    {r.in_library && (
+                      <span className={`badge ${r.library_status || "seen"}`}>
+                        {r.library_status || "in library"}
+                      </span>
+                    )}
+                    <button
+                      className="btn btn-primary"
+                      type="button"
+                      disabled={ixBusy || !r.id || r.library_status === "downloaded"}
+                      onClick={() => void grabInteractiveResult(r)}
+                      title={
+                        r.library_status === "downloaded"
+                          ? "Already downloaded"
+                          : "Queue this video for the series"
+                      }
+                    >
+                      Grab
+                    </button>
+                  </li>
+                ))}
+              </ul>
             </div>
           </div>
         </div>

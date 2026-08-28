@@ -17,6 +17,9 @@ import { ChannelDetailPage } from "./pages/ChannelDetailPage";
 import { SystemPage } from "./pages/SystemPage";
 import { DiscoverPage } from "./pages/DiscoverPage";
 import { LoginPage } from "./pages/LoginPage";
+import { CalendarPage } from "./pages/CalendarPage";
+import { ManualImportPage } from "./pages/ManualImportPage";
+import { TagsPage } from "./pages/TagsPage";
 import { api, clearApiKey, type Dashboard } from "./api";
 import { applyTheme, getStoredTheme, type ThemeId } from "./theme";
 import {
@@ -99,10 +102,18 @@ export default function App() {
       }
     };
     void load();
-    const id = window.setInterval(load, 5000);
+    const id = window.setInterval(() => {
+      if (document.hidden) return;
+      void load();
+    }, 8000);
+    const onVis = () => {
+      if (!document.hidden) void load();
+    };
+    document.addEventListener("visibilitychange", onVis);
     return () => {
       alive = false;
       window.clearInterval(id);
+      document.removeEventListener("visibilitychange", onVis);
     };
   }, [needsLogin, authChecking]);
 
@@ -115,10 +126,15 @@ export default function App() {
 
   const path = location.pathname;
   const libraryOpen =
-    path === "/" || path.startsWith("/add") || path.startsWith("/sources") || path.startsWith("/channel");
+    path === "/" ||
+    path.startsWith("/add") ||
+    path.startsWith("/sources") ||
+    path.startsWith("/channel") ||
+    path.startsWith("/import");
   const discoverOpen = path.startsWith("/discover");
   const activityOpen = path.startsWith("/activity");
   const wantedOpen = path.startsWith("/wanted");
+  const calendarOpen = path.startsWith("/calendar");
   const settingsOpen = path.startsWith("/settings");
   const systemOpen = path.startsWith("/system");
 
@@ -193,7 +209,10 @@ export default function App() {
                 <span className="nav-icon">
                   <IconSources />
                 </span>
-                <span>Library Import</span>
+                <span>Sources</span>
+              </NavLink>
+              <NavLink to="/import" className={childClass}>
+                <span>Manual Import</span>
               </NavLink>
             </>
           )}
@@ -225,8 +244,18 @@ export default function App() {
               <NavLink to="/activity/history" className={childClass}>
                 <span>History</span>
               </NavLink>
+              <NavLink to="/activity/blocklist" className={childClass}>
+                <span>Blocklist</span>
+              </NavLink>
             </>
           )}
+
+          <NavLink to="/calendar" className={() => (calendarOpen ? "active" : undefined)}>
+            <span className="nav-icon">
+              <IconActivity />
+            </span>
+            <span>Calendar</span>
+          </NavLink>
 
           <NavLink to="/wanted" className={navClass}>
             <span className="nav-icon">
@@ -236,9 +265,17 @@ export default function App() {
             {wantedBadge != null && <span className="nav-badge">{wantedBadge}</span>}
           </NavLink>
           {wantedOpen && (
-            <NavLink to="/wanted" end className={childClass}>
-              <span>Missing</span>
-            </NavLink>
+            <>
+              <NavLink to="/wanted" end className={childClass}>
+                <span>Missing</span>
+              </NavLink>
+              <NavLink to="/wanted/cutoff" className={childClass}>
+                <span>Cutoff Unmet</span>
+              </NavLink>
+              <NavLink to="/wanted/failed" className={childClass}>
+                <span>Failed</span>
+              </NavLink>
+            </>
           )}
 
           <NavLink to="/settings/mediamanagement" className={() => (settingsOpen ? "active" : undefined)}>
@@ -257,6 +294,12 @@ export default function App() {
               </NavLink>
               <NavLink to="/settings/downloadclients" className={childClass}>
                 <span>Download Clients</span>
+              </NavLink>
+              <NavLink to="/settings/connect" className={childClass}>
+                <span>Connect</span>
+              </NavLink>
+              <NavLink to="/settings/tags" className={childClass}>
+                <span>Tags</span>
               </NavLink>
               <NavLink to="/settings/general" className={childClass}>
                 <span>General</span>
@@ -283,6 +326,15 @@ export default function App() {
               </NavLink>
               <NavLink to="/system/rootfolders" className={childClass}>
                 <span>Root Folders</span>
+              </NavLink>
+              <NavLink to="/system/tasks" className={childClass}>
+                <span>Tasks</span>
+              </NavLink>
+              <NavLink to="/system/backup" className={childClass}>
+                <span>Backup</span>
+              </NavLink>
+              <NavLink to="/system/updates" className={childClass}>
+                <span>Updates</span>
               </NavLink>
               <NavLink to="/system/logs" className={childClass}>
                 <span>Log</span>
@@ -336,10 +388,15 @@ export default function App() {
             <Route path="/sources" element={<SourcesPage />} />
             <Route path="/rename" element={<Navigate to="/" replace />} />
             <Route path="/wanted" element={<LibraryPage defaultStatus="wanted" />} />
+            <Route path="/wanted/cutoff" element={<LibraryPage defaultStatus="cutoff" />} />
+            <Route path="/wanted/failed" element={<LibraryPage defaultStatus="failed" />} />
             <Route path="/library" element={<Navigate to="/wanted" replace />} />
             <Route path="/activity" element={<Navigate to="/activity/queue" replace />} />
             <Route path="/activity/queue" element={<ActivityPage tab="queue" />} />
             <Route path="/activity/history" element={<ActivityPage tab="history" />} />
+            <Route path="/activity/blocklist" element={<ActivityPage tab="blocklist" />} />
+            <Route path="/calendar" element={<CalendarPage />} />
+            <Route path="/import" element={<ManualImportPage />} />
             <Route path="/queue" element={<Navigate to="/activity/queue" replace />} />
             <Route path="/settings" element={<Navigate to="/settings/mediamanagement" replace />} />
             <Route
@@ -351,9 +408,14 @@ export default function App() {
               path="/settings/downloadclients"
               element={<SettingsPage section="downloadclients" />}
             />
+            <Route path="/settings/connect" element={<SettingsPage section="connect" />} />
+            <Route path="/settings/tags" element={<TagsPage />} />
             <Route path="/settings/general" element={<SettingsPage section="general" />} />
             <Route path="/system" element={<SystemPage section="status" />} />
             <Route path="/system/rootfolders" element={<SystemPage section="rootfolders" />} />
+            <Route path="/system/tasks" element={<SystemPage section="tasks" />} />
+            <Route path="/system/backup" element={<SystemPage section="backup" />} />
+            <Route path="/system/updates" element={<SystemPage section="updates" />} />
             <Route path="/system/logs" element={<SystemPage section="logs" />} />
           </Routes>
         </main>

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import threading
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse
@@ -102,12 +103,16 @@ def _source_out(
         source_type=source.source_type,
         enabled=source.enabled,
         monitor_mode=source.monitor_mode,
+        description=getattr(source, "description", None),
+        subscriber_count=getattr(source, "subscriber_count", None),
         quality=getattr(source, "quality", "") or "",
         media_type=getattr(source, "media_type", "video") or "video",
         folder_name=source.folder_name,
         poster_path=source.poster_path,
         fanart_path=source.fanart_path,
         parent_source_id=getattr(source, "parent_source_id", None),
+        tags=getattr(source, "tags", "") or "",
+        season_number=int(getattr(source, "season_number", None) or 1),
         last_checked=source.last_checked,
         initialized=source.initialized,
         created_at=source.created_at,
@@ -125,8 +130,22 @@ def health() -> HealthOut:
     cfg = get_config()
     ok, version, err = ytdlp.get_version()
     bind = get_listen_bind()
+    warnings: list[str] = []
+    cookies_file = (getattr(cfg, "ytdlp_cookies_path", "") or "").strip()
+    browser = (getattr(cfg, "ytdlp_cookies_from_browser", "") or "").strip().lower()
+    if browser in {"chrome", "edge", "brave", "chromium"} and not (
+        cookies_file and Path(cookies_file).is_file()
+    ):
+        warnings.append(
+            f"Cookies from browser is set to {browser.title()} without a cookies.txt file. "
+            "Chrome/Edge often lock or encrypt the cookie DB on Windows — prefer Off + "
+            "a Netscape cookies.txt, or Firefox. Settings → Download Clients."
+        )
+    status = "ok" if ok and not warnings else ("degraded" if not ok else "ok")
+    if warnings and ok:
+        status = "warning"
     return HealthOut(
-        status="ok" if ok else "degraded",
+        status=status,
         ytdlp_ok=ok,
         ytdlp_version=version,
         ytdlp_error=err,
@@ -137,6 +156,7 @@ def health() -> HealthOut:
         listen_host=bind[0] if bind else None,
         listen_port=bind[1] if bind else None,
         restart_required=restart_required_for_bind(cfg),
+        warnings=warnings,
     )
 
 
@@ -164,6 +184,7 @@ def dashboard(db: Session = Depends(get_db)) -> DashboardOut:
         queue_size=queue_size,
         ytdlp_ok=ok,
         ytdlp_version=version,
+        downloads_paused=bool(get_config().downloads_paused),
     )
 
 
@@ -488,6 +509,7 @@ def patch_source(
     source = db.get(MonitoredSource, source_id)
     if not source:
         raise HTTPException(status_code=404, detail="Source not found")
+    old_quality = (source.quality or "").strip().lower()
     if body.enabled is not None:
         source.enabled = body.enabled
     if body.title is not None:
@@ -498,9 +520,26 @@ def patch_source(
         source.quality = body.quality.strip().lower()
     if body.media_type is not None:
         source.media_type = body.media_type
+    if body.tags is not None:
+        # Normalize: comma-separated unique labels
+        parts = [p.strip() for p in str(body.tags).split(",") if p.strip()]
+        source.tags = ", ".join(dict.fromkeys(parts))
     db.add(source)
     db.commit()
     db.refresh(source)
+    # Quality upgrade: re-queue downloaded episodes when quality preset changes
+    new_quality = (source.quality or "").strip().lower()
+    if body.quality is not None and new_quality and new_quality != old_quality:
+        bumped = 0
+        for video in db.query(Video).filter(Video.source_id == source.id).all():
+            if video.status == VideoStatus.DOWNLOADED.value:
+                video.status = VideoStatus.WANTED.value
+                video.error = f"Quality upgrade → {new_quality}"
+                db.add(video)
+                bumped += 1
+        if bumped:
+            db.commit()
+            downloader.enqueue_wanted(db)
     return _source_out(db, source)
 
 
@@ -514,6 +553,14 @@ def delete_source(
     if not source:
         raise HTTPException(status_code=404, detail="Source not found")
     result = monitor.delete_source_tree(db, source, delete_files=delete_files)
+    if delete_files:
+        try:
+            from ..services import plex
+
+            media = getattr(source, "media_type", "video") or "video"
+            plex.notify_library_changed(media_type=media)
+        except Exception:
+            pass
     return {"ok": True, "delete_files": delete_files, **result}
 
 
@@ -561,6 +608,19 @@ def refresh_artwork(
     return _source_out(db, source)
 
 
+@router.post("/sources/{source_id}/refresh-metadata", response_model=SourceOut)
+def refresh_source_metadata(source_id: int, db: Session = Depends(get_db)) -> SourceOut:
+    """Backfill the YouTube About text / subscriber count for an existing source."""
+    source = db.get(MonitoredSource, source_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+    try:
+        monitor.refresh_source_metadata(db, source)
+    except ytdlp.YtDlpError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return _source_out(db, source)
+
+
 @router.get("/sources/{source_id}/poster")
 def source_poster(source_id: int, db: Session = Depends(get_db)):
     source = db.get(MonitoredSource, source_id)
@@ -597,8 +657,20 @@ def list_videos(
     db: Session = Depends(get_db),
 ) -> list[VideoOut]:
     # limit=0 means no cap (selection / admin); otherwise clamp
-    q = db.query(Video).join(MonitoredSource)
-    if status:
+    q = db.query(Video).options(joinedload(Video.source))
+    if status == "cutoff":
+        # Quality-upgrade requeues (Sonarr Cutoff Unmet analogue)
+        q = q.filter(Video.error.ilike("%Quality upgrade%")).filter(
+            Video.status.in_(
+                [
+                    VideoStatus.WANTED.value,
+                    VideoStatus.QUEUED.value,
+                    VideoStatus.DOWNLOADING.value,
+                    VideoStatus.FAILED.value,
+                ]
+            )
+        )
+    elif status:
         q = q.filter(Video.status == status)
     if source_id:
         q = q.filter(Video.source_id == source_id)
@@ -621,6 +693,7 @@ def retry_video(video_id: int, db: Session = Depends(get_db)) -> VideoOut:
         raise HTTPException(status_code=404, detail="Video not found")
     video.status = VideoStatus.WANTED.value
     video.error = None
+    video.retry_count = 0
     db.add(video)
     db.commit()
     downloader.enqueue_wanted(db)
@@ -692,6 +765,10 @@ def list_queue(
     return [_job_out(job) for job in jobs]
 
 
+_queue_kick_lock = threading.Lock()
+_queue_kick_running = False
+
+
 @router.post("/queue/process")
 def process_queue() -> dict:
     """Kick the download worker without blocking the HTTP request.
@@ -699,10 +776,22 @@ def process_queue() -> dict:
     Downloads can take minutes; callers (Add New, etc.) must not wait on them.
     The APScheduler tick also runs this work every ~15s.
     """
-    import threading
+    global _queue_kick_running
+    with _queue_kick_lock:
+        if _queue_kick_running:
+            return {"ok": True, "started": False, "busy": True}
+        _queue_kick_running = True
+
+    def _run() -> None:
+        global _queue_kick_running
+        try:
+            downloader.worker_tick()
+        finally:
+            with _queue_kick_lock:
+                _queue_kick_running = False
 
     threading.Thread(
-        target=downloader.worker_tick,
+        target=_run,
         name="ytarr-queue-kick",
         daemon=True,
     ).start()
@@ -747,6 +836,7 @@ def retry_queue_job(job_id: int, db: Session = Depends(get_db)) -> DownloadJobOu
         raise HTTPException(status_code=400, detail="Only failed or cancelled jobs can be retried")
     video.status = VideoStatus.WANTED.value
     video.error = None
+    video.retry_count = 0
     db.add(video)
     db.commit()
     downloader.enqueue_wanted(db)
@@ -763,20 +853,16 @@ def retry_queue_job(job_id: int, db: Session = Depends(get_db)) -> DownloadJobOu
 
 @router.post("/queue/{job_id}/cancel", response_model=DownloadJobOut)
 def cancel_queue_job(job_id: int, db: Session = Depends(get_db)) -> DownloadJobOut:
-    """Cancel a queued job, or mark an in-progress download ignored (v1: no process kill)."""
+    """Cancel a queued or in-progress download and stop yt-dlp if it is running."""
     job = db.get(DownloadJob, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status not in {"queued", "downloading"}:
         raise HTTPException(status_code=400, detail="Only queued or downloading jobs can be cancelled")
     video = db.get(Video, job.video_id)
-    was_downloading = job.status == "downloading"
     job.status = "cancelled"
     job.finished_at = datetime.utcnow()
-    if was_downloading:
-        job.error = "Cancelled (active yt-dlp may finish; file will be ignored if it completes)"
-    else:
-        job.error = "Cancelled"
+    job.error = "Cancelled"
     db.add(job)
     if video:
         video.status = VideoStatus.IGNORED.value
@@ -784,6 +870,7 @@ def cancel_queue_job(job_id: int, db: Session = Depends(get_db)) -> DownloadJobO
         db.add(video)
     db.commit()
     db.refresh(job)
+    downloader.cancel_job_process(job_id)
     return _job_out(job)
 
 
@@ -819,4 +906,388 @@ def rename_apply(body: RenameApplyIn, db: Session = Depends(get_db)) -> RenameAp
         source_id=body.source_id,
         video_ids=body.video_ids,
     )
+    if result.get("renamed"):
+        try:
+            from ..services import plex
+
+            plex.notify_library_changed(media_type="video")
+            plex.notify_library_changed(media_type="audio")
+        except Exception:
+            pass
     return RenameApplyOut(**result)
+
+
+@router.get("/connect/plex/sections")
+def plex_sections() -> dict:
+    from ..services import plex
+
+    try:
+        sections = plex.list_sections()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"sections": sections}
+
+
+@router.post("/connect/plex/test")
+def plex_test() -> dict:
+    from ..services import plex
+
+    return plex.test_connection()
+
+
+@router.post("/connect/plex/refresh")
+def plex_refresh(media_type: str = "video", path: str | None = None) -> dict:
+    from ..services import plex
+
+    cfg = get_config()
+    sid = (
+        (cfg.plex_music_section_id if media_type == "audio" else cfg.plex_video_section_id)
+        or ""
+    ).strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="Configure a Plex section id first")
+    return plex.refresh_section(sid, path=path)
+
+
+@router.get("/system/tasks")
+def system_tasks() -> dict:
+    return {"tasks": scheduler.list_tasks()}
+
+
+@router.post("/system/tasks/{task_id}/run")
+def run_system_task(task_id: str) -> dict:
+    from ..db import SessionLocal
+
+    if task_id == "monitor":
+        db = SessionLocal()
+        try:
+            results = monitor.check_all_enabled(db)
+            downloader.enqueue_wanted(db)
+            return {"ok": True, "checked": len(results)}
+        finally:
+            db.close()
+    if task_id == "downloads":
+        downloader.worker_tick()
+        return {"ok": True}
+    if task_id == "ytdlp_update":
+        from ..services import ytdlp_update
+
+        return ytdlp_update.maybe_update_ytdlp(force=True)
+    raise HTTPException(status_code=404, detail="Unknown task")
+
+
+@router.get("/system/backup")
+def list_system_backups() -> dict:
+    from ..services import backup
+
+    return {"backups": backup.list_backups()}
+
+
+@router.post("/system/backup")
+def create_system_backup() -> dict:
+    from ..services import backup
+
+    return backup.create_backup()
+
+
+@router.post("/system/backup/restore")
+def restore_system_backup(name: str) -> dict:
+    from ..services import backup
+
+    try:
+        return backup.restore_backup(name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/system/updates")
+def system_updates() -> dict:
+    from ..version import app_version
+
+    ok, version, err = ytdlp.get_version()
+    return {
+        "app_version": app_version(),
+        "ytdlp_ok": ok,
+        "ytdlp_version": version,
+        "ytdlp_error": err,
+        "note": "yt-dlp/ffmpeg auto-update every 24h; use Run update to refresh now.",
+    }
+
+
+@router.post("/system/updates/ytdlp")
+def trigger_ytdlp_update() -> dict:
+    from ..services import ytdlp_update
+
+    return ytdlp_update.maybe_update_ytdlp()
+
+
+@router.get("/calendar")
+def calendar_events(
+    start: str | None = None,
+    end: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Episodes with publish dates in range (monitored sources)."""
+    from datetime import timedelta
+
+    now = datetime.utcnow()
+    try:
+        def _parse(raw: str | None, default: datetime) -> datetime:
+            if not raw:
+                return default
+            text = raw.strip().replace("Z", "+00:00")
+            return datetime.fromisoformat(text).replace(tzinfo=None)
+
+        start_dt = _parse(start, now - timedelta(days=14))
+        end_dt = _parse(end, now + timedelta(days=30))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid start/end") from exc
+    q = (
+        db.query(Video)
+        .options(joinedload(Video.source))
+        .join(MonitoredSource)
+        .filter(MonitoredSource.enabled.is_(True))
+        .filter(Video.published_at.isnot(None))
+        .filter(Video.published_at >= start_dt)
+        .filter(Video.published_at <= end_dt)
+        .order_by(Video.published_at.asc())
+        .limit(500)
+    )
+    events = []
+    for v in q.all():
+        events.append(
+            {
+                "id": v.id,
+                "title": v.title,
+                "video_id": v.video_id,
+                "status": v.status,
+                "published_at": v.published_at.isoformat() if v.published_at else None,
+                "source_id": v.source_id,
+                "source_title": v.source.title if v.source else None,
+            }
+        )
+    return {"events": events, "start": start_dt.isoformat(), "end": end_dt.isoformat()}
+
+
+@router.get("/blocklist")
+def blocklist(limit: int = 200, db: Session = Depends(get_db)) -> dict:
+    limit = max(1, min(int(limit), 500))
+    rows = (
+        db.query(Video)
+        .options(joinedload(Video.source))
+        .filter(Video.status == VideoStatus.IGNORED.value)
+        .order_by(Video.updated_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return {
+        "items": [
+            {
+                "id": v.id,
+                "title": v.title,
+                "video_id": v.video_id,
+                "error": v.error,
+                "source_id": v.source_id,
+                "source_title": v.source.title if v.source else None,
+                "updated_at": v.updated_at.isoformat() if v.updated_at else None,
+            }
+            for v in rows
+        ]
+    }
+
+
+@router.delete("/blocklist/{video_id}")
+def unblock_video(video_id: int, db: Session = Depends(get_db)) -> dict:
+    video = db.get(Video, video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Not found")
+    video.status = VideoStatus.SEEN.value
+    video.error = None
+    db.add(video)
+    db.commit()
+    return {"ok": True}
+
+
+@router.get("/import/scan")
+def import_scan(limit: int = 200, db: Session = Depends(get_db)) -> dict:
+    from ..services import manual_import
+
+    return {"items": manual_import.scan_orphans(db, limit=limit)}
+
+
+@router.post("/import/apply")
+def import_apply(body: dict, db: Session = Depends(get_db)) -> dict:
+    from ..services import manual_import, plex
+
+    items = body.get("items") or []
+    source_id = body.get("source_id")
+    result = manual_import.import_files(db, items, source_id=source_id)
+    if result.get("imported"):
+        try:
+            plex.notify_library_changed(media_type="video")
+        except Exception:
+            pass
+    return result
+
+
+@router.get("/sources/{source_id}/interactive-search")
+def interactive_search(
+    source_id: int,
+    q: str | None = None,
+    limit: int = 20,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Search YouTube for episodes related to this source (Arr Interactive Search)."""
+    source = db.get(MonitoredSource, source_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+    query = (q or source.title or "").strip()
+    if len(query) < 2:
+        raise HTTPException(status_code=400, detail="Query too short")
+    try:
+        hits = ytdlp.search_youtube(query, kind="video", limit=limit)
+    except ytdlp.YtDlpError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    known = {
+        v.video_id: v.status
+        for v in db.query(Video).filter(Video.source_id == source_id).all()
+    }
+    results = []
+    for h in hits:
+        vid = h.id or ""
+        results.append(
+            {
+                **h.__dict__,
+                "in_library": vid in known,
+                "library_status": known.get(vid),
+            }
+        )
+    return {"query": query, "results": results}
+
+
+@router.post("/sources/{source_id}/interactive-search/grab")
+def grab_interactive_result(
+    source_id: int,
+    body: dict,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Queue a YouTube video from Interactive Search under this series (Arr Grab)."""
+    source = db.get(MonitoredSource, source_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+    video_id = str(body.get("video_id") or body.get("id") or "").strip()
+    title = str(body.get("title") or "Untitled").strip() or "Untitled"
+    if not video_id:
+        raise HTTPException(status_code=400, detail="video_id required")
+    existing = (
+        db.query(Video)
+        .filter(Video.source_id == source_id, Video.video_id == video_id)
+        .one_or_none()
+    )
+    if existing:
+        if existing.status == VideoStatus.DOWNLOADED.value and existing.file_path:
+            return {
+                "ok": True,
+                "already": True,
+                "video_id": existing.id,
+                "status": existing.status,
+                "message": "Already downloaded for this series",
+            }
+        existing.status = VideoStatus.WANTED.value
+        existing.error = None
+        existing.retry_count = 0
+        if title and title != "Untitled":
+            existing.title = title[:512]
+        db.add(existing)
+        video = existing
+        created = False
+    else:
+        video = Video(
+            source_id=source.id,
+            video_id=video_id,
+            title=title[:512],
+            status=VideoStatus.WANTED.value,
+        )
+        db.add(video)
+        created = True
+    db.commit()
+    db.refresh(video)
+    downloader.enqueue_wanted(db)
+    try:
+        from ..services import notify
+
+        notify.on_grab(title=video.title, video_id=video.video_id, source_title=source.title)
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "created": created,
+        "video_id": video.id,
+        "youtube_id": video.video_id,
+        "status": video.status,
+        "message": "Queued for download",
+    }
+
+
+@router.get("/tags")
+def list_tags(db: Session = Depends(get_db)) -> dict:
+    tags: dict[str, int] = {}
+    for (raw,) in db.query(MonitoredSource.tags).all():
+        for part in str(raw or "").split(","):
+            p = part.strip()
+            if p:
+                tags[p] = tags.get(p, 0) + 1
+    return {
+        "tags": sorted(tags.keys(), key=str.lower),
+        "counts": {k: tags[k] for k in sorted(tags.keys(), key=str.lower)},
+    }
+
+
+@router.post("/tags/rename")
+def rename_tag(body: dict, db: Session = Depends(get_db)) -> dict:
+    old = str(body.get("from") or body.get("old") or "").strip()
+    new = str(body.get("to") or body.get("new") or "").strip()
+    if not old or not new:
+        raise HTTPException(status_code=400, detail="from and to required")
+    if old.lower() == new.lower() and old != new:
+        # case-only rename — still apply
+        pass
+    elif old.lower() == new.lower():
+        return {"ok": True, "updated": 0}
+    updated = 0
+    for source in db.query(MonitoredSource).all():
+        parts = [p.strip() for p in str(source.tags or "").split(",") if p.strip()]
+        if not any(p.lower() == old.lower() for p in parts):
+            continue
+        next_parts: list[str] = []
+        seen: set[str] = set()
+        for p in parts:
+            label = new if p.lower() == old.lower() else p
+            key = label.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            next_parts.append(label)
+        source.tags = ", ".join(next_parts)
+        db.add(source)
+        updated += 1
+    db.commit()
+    return {"ok": True, "updated": updated, "from": old, "to": new}
+
+
+@router.delete("/tags/{tag_name}")
+def delete_tag(tag_name: str, db: Session = Depends(get_db)) -> dict:
+    target = (tag_name or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="tag required")
+    updated = 0
+    for source in db.query(MonitoredSource).all():
+        parts = [p.strip() for p in str(source.tags or "").split(",") if p.strip()]
+        next_parts = [p for p in parts if p.lower() != target.lower()]
+        if len(next_parts) == len(parts):
+            continue
+        source.tags = ", ".join(next_parts)
+        db.add(source)
+        updated += 1
+    db.commit()
+    return {"ok": True, "updated": updated, "tag": target}

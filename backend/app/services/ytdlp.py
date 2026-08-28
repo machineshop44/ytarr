@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -48,6 +49,8 @@ class PlaylistEntry:
     duration: int | None = None
     thumbnail_url: str | None = None
     url: str | None = None
+    playlist_index: int | None = None
+    description: str | None = None
 
 
 # yt-dlp availability values we cannot download without special auth/cookies
@@ -92,6 +95,8 @@ class SourceInfo:
     thumbnail_url: str | None = None
     banner_url: str | None = None
     webpage_url: str | None = None
+    description: str | None = None
+    subscriber_count: int | None = None
 
 
 def _ssl_env() -> dict[str, str]:
@@ -290,11 +295,138 @@ def _subprocess_hide_kwargs() -> dict[str, Any]:
     return {"creationflags": flags}
 
 
-def _common_prefix_args() -> list[str]:
+_download_procs: dict[int, subprocess.Popen[str]] = {}
+_killed_jobs: set[int] = set()
+_download_proc_lock = threading.Lock()
+
+
+def _kill_proc_tree(proc: subprocess.Popen[str]) -> None:
+    pid = proc.pid
+    if not pid:
+        return
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                check=False,
+                capture_output=True,
+                **_subprocess_hide_kwargs(),
+            )
+        else:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def kill_download_process(job_id: int) -> bool:
+    """Stop an in-flight yt-dlp (+ ffmpeg) tree for this download job."""
+    jid = int(job_id)
+    with _download_proc_lock:
+        _killed_jobs.add(jid)
+        proc = _download_procs.pop(jid, None)
+    if proc is None:
+        return False
+    _kill_proc_tree(proc)
+    return True
+
+
+def kill_all_download_processes() -> int:
+    with _download_proc_lock:
+        items = list(_download_procs.items())
+        _download_procs.clear()
+        for jid, _proc in items:
+            _killed_jobs.add(jid)
+    n = 0
+    for _jid, proc in items:
+        _kill_proc_tree(proc)
+        n += 1
+    return n
+
+
+# Chrome/Edge on Windows: App-Bound encryption (yt-dlp#10927) or locked cookie DB
+# while the browser is open (yt-dlp#7271). Prefer Netscape cookies.txt.
+_BROWSER_COOKIES_GUIDANCE = (
+    "Browser cookies blocked yt-dlp on Windows (Chrome/Edge locked DB or App-Bound "
+    "encryption). Fix: export a Netscape cookies.txt (e.g. extension "
+    "\"Get cookies.txt LOCALLY\" while signed into YouTube), set Settings → "
+    "Download Clients → Cookies file to that path, and set Cookies from browser "
+    "to Off. Alternatives: close Chrome/Edge completely, or use Firefox for "
+    "cookies-from-browser. "
+    "See https://github.com/yt-dlp/yt-dlp/issues/7271 and "
+    "https://github.com/yt-dlp/yt-dlp/issues/10927"
+)
+
+_BROWSER_COOKIE_NAMES = frozenset(
+    {"chrome", "edge", "firefox", "brave", "chromium", "opera", "vivaldi"}
+)
+
+
+def _is_browser_cookie_error(blob: str) -> bool:
+    """True for DPAPI / App-Bound decrypt failures and locked cookie-DB copy errors."""
+    b = (blob or "").lower()
+    if not b:
+        return False
+    if "failed to decrypt with dpapi" in b or "decrypt with dpapi" in b:
+        return True
+    if "dpapi" in b and ("cookie" in b or "10927" in b):
+        return True
+    if "app-bound" in b or "app_bound" in b or "appbound" in b:
+        return True
+    if "could not copy" in b and "cookie" in b:
+        return True
+    if "7271" in b and "cookie" in b:
+        return True
+    return False
+
+
+# Back-compat alias used by older call sites / tests
+def _is_dpapi_cookie_error(blob: str) -> bool:
+    return _is_browser_cookie_error(blob)
+
+
+def _enrich_ytdlp_error(msg: str) -> str:
+    """Replace cryptic yt-dlp cookie failures with actionable guidance."""
+    text = (msg or "").strip()
+    if not text:
+        return text
+    if _is_browser_cookie_error(text):
+        return (
+            "Failed to read browser cookies (locked DB / DPAPI / App-Bound). "
+            + _BROWSER_COOKIES_GUIDANCE
+        )
+    return text
+
+
+def _ytdlp_failure_message(
+    result: subprocess.CompletedProcess[str],
+    fallback: str,
+) -> str:
+    raw = (result.stderr or result.stdout or fallback).strip() or fallback
+    return _enrich_ytdlp_error(raw)
+
+
+def _common_prefix_args(*, include_cookies: bool = True) -> list[str]:
     cfg = get_config()
     prefix: list[str] = []
     if cfg.nocheck_certificates:
         prefix.append("--no-check-certificates")
+    # Prefer Netscape cookies.txt when the file exists — never combine with
+    # --cookies-from-browser (Chrome/Edge DPAPI would still fail and confuse).
+    if include_cookies:
+        cookies_path = (cfg.ytdlp_cookies_path or "").strip()
+        if cookies_path and Path(cookies_path).is_file():
+            prefix.extend(["--cookies", cookies_path])
+        else:
+            browser = (cfg.ytdlp_cookies_from_browser or "").strip().lower()
+            if browser in _BROWSER_COOKIE_NAMES:
+                prefix.extend(["--cookies-from-browser", browser])
     prefix.extend(_js_runtime_args())
     prefix.extend(_ffmpeg_location_args())
     return prefix
@@ -305,10 +437,14 @@ def _run(
     *,
     timeout: int | None = 120,
     capture: bool = True,
+    include_cookies: bool = True,
+    cookie_fallback: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    cmd = [*_ytdlp_cmd(), *_common_prefix_args(), *args]
+    """Run yt-dlp. On browser-cookie failures, optionally retry once without cookies
+    so public channel/playlist catalog still loads while Chrome is open."""
+    cmd = [*_ytdlp_cmd(), *_common_prefix_args(include_cookies=include_cookies), *args]
     try:
-        return subprocess.run(
+        result = subprocess.run(
             cmd,
             check=False,
             capture_output=capture,
@@ -327,6 +463,32 @@ def _run(
         ) from exc
     except subprocess.TimeoutExpired as exc:
         raise YtDlpError(f"yt-dlp timed out: {' '.join(cmd)}") from exc
+
+    if (
+        include_cookies
+        and cookie_fallback
+        and result.returncode != 0
+        and _is_browser_cookie_error((result.stderr or "") + "\n" + (result.stdout or ""))
+    ):
+        try:
+            from . import applog
+
+            applog.log_error(
+                "Browser cookies failed; retrying yt-dlp without cookies. "
+                "Set a cookies.txt file or turn Cookies from browser Off. "
+                + _BROWSER_COOKIES_GUIDANCE,
+                source="ytdlp",
+            )
+        except Exception:
+            pass
+        return _run(
+            args,
+            timeout=timeout,
+            capture=capture,
+            include_cookies=False,
+            cookie_fallback=False,
+        )
+    return result
 
 
 # UI polls /dashboard every few seconds — do not spawn yt-dlp each time.
@@ -349,7 +511,8 @@ def get_version(*, force: bool = False) -> tuple[bool, str | None, str | None]:
     ):
         return _version_cache[1]
     try:
-        result = _run(["--version"], timeout=30)
+        # Skip cookies — --version must not fail on Chrome/Edge DPAPI
+        result = _run(["--version"], timeout=30, include_cookies=False)
     except YtDlpError as exc:
         out = (False, None, str(exc))
         _version_cache = (now, out)
@@ -585,7 +748,7 @@ def resolve_source(url: str) -> SourceInfo:
         timeout=180,
     )
     if result.returncode != 0:
-        raise YtDlpError((result.stderr or result.stdout or "Failed to resolve source").strip())
+        raise YtDlpError(_ytdlp_failure_message(result, "Failed to resolve source"))
 
     info = json.loads(result.stdout)
     source_type = _guess_source_type(url, info)
@@ -635,6 +798,16 @@ def resolve_source(url: str) -> SourceInfo:
             banner = url_t
             break
 
+    desc_raw = info.get("description")
+    description = str(desc_raw).strip() if desc_raw else ""
+    if len(description) > 4000:
+        description = description[:3999].rstrip() + "…"
+    subs_raw = info.get("channel_follower_count") or info.get("subscriber_count")
+    try:
+        subscriber_count = int(subs_raw) if subs_raw is not None else None
+    except (TypeError, ValueError):
+        subscriber_count = None
+
     return SourceInfo(
         title=str(title),
         yt_id=str(yt_id) if yt_id else None,
@@ -643,6 +816,8 @@ def resolve_source(url: str) -> SourceInfo:
         thumbnail_url=str(thumb) if thumb else None,
         banner_url=str(banner) if banner else None,
         webpage_url=info.get("webpage_url") or url,
+        description=description,
+        subscriber_count=subscriber_count,
     )
 
 
@@ -692,7 +867,7 @@ def search_youtube(
     args = ["--flat-playlist", "--dump-json", "--no-download", "--playlist-end", str(limit), search_url]
     result = _run(args, timeout=180)
     if result.returncode != 0:
-        raise YtDlpError((result.stderr or result.stdout or "YouTube search failed").strip())
+        raise YtDlpError(_ytdlp_failure_message(result, "YouTube search failed"))
 
     hits: list[SearchHit] = []
     seen_ids: set[str] = set()
@@ -790,6 +965,14 @@ def channel_topic_tags(channel_url: str) -> list[str]:
         timeout=90,
     )
     if result.returncode != 0 or not result.stdout:
+        err = (result.stderr or result.stdout or "").strip()
+        if err and _is_dpapi_cookie_error(err):
+            try:
+                from . import applog
+
+                applog.log_error(_enrich_ytdlp_error(err), source="ytdlp")
+            except Exception:
+                pass
         return []
     try:
         info = json.loads(result.stdout)
@@ -944,7 +1127,7 @@ def list_channel_playlists(channel_url: str, *, limit: int = 50) -> list[SearchH
     result = _run(args, timeout=90)
     if result.returncode != 0:
         raise YtDlpError(
-            (result.stderr or result.stdout or "Failed to list channel playlists").strip()
+            _ytdlp_failure_message(result, "Failed to list channel playlists")
         )
 
     # Optional badge counts — do not block the add UI if this scrape is slow.
@@ -1035,25 +1218,37 @@ def list_channel_playlists(channel_url: str, *, limit: int = 50) -> list[SearchH
     return hits
 
 
-def list_entries(url: str, *, limit: int | None = None) -> list[PlaylistEntry]:
+def list_entries(
+    url: str,
+    *,
+    limit: int | None = None,
+    playlist_start: int | None = None,
+    playlist_end: int | None = None,
+) -> list[PlaylistEntry]:
+    # --playlist-end must come before URL
     args = [
         "--flat-playlist",
         "--dump-json",
         "--no-download",
-        url,
+        # YouTube flat feeds omit exact upload_date; approximate from "3 months ago".
+        # Never use `epoch` — that is extraction time (always "now").
+        "--extractor-args",
+        "youtubetab:approximate_date",
     ]
-    if limit is not None:
-        args[0:0] = ["--playlist-end", str(limit)]
-
-    # --playlist-end must come before URL; rebuild carefully
-    args = ["--flat-playlist", "--dump-json", "--no-download"]
-    if limit is not None:
-        args.extend(["--playlist-end", str(limit)])
+    start = playlist_start
+    end = playlist_end
+    if limit is not None and start is None and end is None:
+        end = int(limit)
+    if start is not None:
+        args.extend(["--playlist-start", str(max(1, int(start)))])
+    if end is not None:
+        args.extend(["--playlist-end", str(max(1, int(end)))])
     args.append(url)
 
-    result = _run(args, timeout=300)
+    timeout = 120 if (start is not None or end is not None) else 300
+    result = _run(args, timeout=timeout)
     if result.returncode != 0:
-        raise YtDlpError((result.stderr or result.stdout or "Failed to list entries").strip())
+        raise YtDlpError(_ytdlp_failure_message(result, "Failed to list entries"))
 
     entries: list[PlaylistEntry] = []
     for line in (result.stdout or "").splitlines():
@@ -1072,6 +1267,15 @@ def list_entries(url: str, *, limit: int | None = None) -> list[PlaylistEntry]:
             continue
         if _is_undownloadable(item):
             continue
+        pi = item.get("playlist_index") or item.get("playlist_autonumber")
+        try:
+            playlist_index = int(pi) if pi is not None else None
+        except (TypeError, ValueError):
+            playlist_index = None
+        desc_raw = item.get("description")
+        description = str(desc_raw).strip() if desc_raw else None
+        if description and len(description) > 8000:
+            description = description[:7999].rstrip() + "…"
         entries.append(
             PlaylistEntry(
                 video_id=str(vid),
@@ -1081,19 +1285,57 @@ def list_entries(url: str, *, limit: int | None = None) -> list[PlaylistEntry]:
                     or item.get("release_date")
                     or item.get("timestamp")
                     or item.get("release_timestamp")
-                    or item.get("epoch")
                 ),
                 duration=int(item["duration"]) if item.get("duration") else None,
                 thumbnail_url=item.get("thumbnail") or _pick_best_thumbnail(item.get("thumbnails")),
                 url=item.get("url") or item.get("webpage_url"),
+                playlist_index=playlist_index,
+                description=description,
             )
         )
-    # Prefer newest-first when dates exist (Uploads / dated playlists)
-    entries.sort(
-        key=lambda e: e.published_at or datetime.min,
-        reverse=True,
-    )
+    # Keep playlist order when yt-dlp provides indices; otherwise Uploads newest-first.
+    if any(e.playlist_index for e in entries):
+        entries.sort(key=lambda e: (e.playlist_index is None, e.playlist_index or 10**9))
+    else:
+        entries.sort(
+            key=lambda e: e.published_at or datetime.min,
+            reverse=True,
+        )
     return entries
+
+
+def fetch_video_description(video_id: str) -> str | None:
+    """Best-effort YouTube description for NFO synopsis (flat lists often omit it)."""
+    vid = (video_id or "").strip()
+    if not vid:
+        return None
+    url = f"https://www.youtube.com/watch?v={vid}"
+    args = [
+        "--skip-download",
+        "--no-playlist",
+        "--dump-json",
+        url,
+    ]
+    try:
+        result = _run(args, timeout=90)
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    line = (result.stdout or "").strip().splitlines()
+    if not line:
+        return None
+    try:
+        item = json.loads(line[0])
+    except json.JSONDecodeError:
+        return None
+    desc = item.get("description")
+    if not desc:
+        return None
+    text = str(desc).strip()
+    if len(text) > 8000:
+        text = text[:7999].rstrip() + "…"
+    return text or None
 
 
 def download_image(url: str, dest: Path) -> Path | None:
@@ -1235,6 +1477,25 @@ def _normalize_sponsorblock_categories(raw: str | None) -> str | None:
     return ",".join(parts) if parts else None
 
 
+def _is_player_client_retryable(blob: str) -> bool:
+    b = blob.lower()
+    needles = (
+        "http error 403",
+        "403:",
+        "403 forbidden",
+        "sign in to confirm",
+        "confirm you're not a bot",
+        "confirm you are not a bot",
+        "bot check",
+        "only images are available",
+        "requested format is not available",
+        "format is not available",
+        "this content isn't available",
+        "unable to download api page",
+    )
+    return any(n in b for n in needles)
+
+
 def download_video(
     video_url: str,
     *,
@@ -1245,6 +1506,7 @@ def download_video(
     extract_audio: bool = False,
     audio_quality: str = "0",
     sponsorblock_categories: str | None = None,
+    job_id: int | None = None,
 ) -> Path | None:
     library_root.mkdir(parents=True, exist_ok=True)
     # Keep template separators as yt-dlp expects (/); don't let Path flip them on Windows
@@ -1261,95 +1523,171 @@ def download_video(
             "Install tools/ffmpeg or disable SponsorBlock remove in Settings."
         )
     fmt, needs_merge = _resolve_format(format_selector)
-    args = [
-        *_common_prefix_args(),
-        "--newline",
-        "--retries",
-        "10",
-        "--fragment-retries",
-        "10",
-        "-f",
-        fmt,
-        "-o",
-        outtmpl,
-        "--print",
-        "after_move:filepath",
-        "--print",
-        "filepath",
-        video_url,
-    ]
-    if sys.platform.startswith("win"):
-        args[0:0] = ["--windows-filenames"]
-    if extract_audio:
-        aq = (audio_quality or "0").strip() or "0"
-        args.extend(["-x", "--audio-format", "m4a", "--audio-quality", aq])
-    elif needs_merge:
-        args.extend(["--merge-output-format", "mkv"])
-    if sb_cats:
-        args.extend(["--sponsorblock-remove", sb_cats])
 
-    cmd = [*_ytdlp_cmd(), *args]
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=_ssl_env(),
-            **_subprocess_hide_kwargs(),
-        )
-    except FileNotFoundError as exc:
-        raise YtDlpError(f"yt-dlp not found ({' '.join(_ytdlp_cmd())})") from exc
-
-    file_path: Path | None = None
-    tail: list[str] = []
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        line = line.rstrip()
-        if line:
-            tail.append(line)
-            if len(tail) > 40:
-                tail = tail[-40:]
-        match = PROGRESS_RE.search(line)
-        if match and progress_cb:
-            try:
-                progress_cb(float(match.group("pct")))
-            except ValueError:
-                pass
-        # yt-dlp print filepath lines (absolute paths)
-        if line and not line.startswith("[") and Path(line).suffix and ("/" in line or "\\" in line):
-            candidate = Path(line.strip())
-            if candidate.suffix.lower() in {".mkv", ".mp4", ".webm", ".m4a", ".mp3", ".opus"}:
-                file_path = candidate
-
-    code = proc.wait()
-    if code != 0:
-        err_lines = [
-            ln
-            for ln in tail
-            if ln.startswith("ERROR:")
-            or "ERROR:" in ln
-            or ln.startswith("WARNING:")
-            or "ffmpeg" in ln.lower()
+    def _build_args(*, player_clients: str | None = None, include_cookies: bool = True) -> list[str]:
+        args = [
+            *_common_prefix_args(include_cookies=include_cookies),
+            "--newline",
+            "--retries",
+            "10",
+            "--fragment-retries",
+            "10",
+            "--retry-sleep",
+            "http:2",
+            "--retry-sleep",
+            "fragment:2",
+            "--sleep-requests",
+            "1",
+            "-f",
+            fmt,
+            "-o",
+            outtmpl,
+            "--print",
+            "after_move:filepath",
+            "--print",
+            "filepath",
         ]
-        detail = " | ".join(err_lines[-4:]) if err_lines else (" | ".join(tail[-6:]) if tail else "no output")
-        hint = ""
-        blob = " ".join(tail).lower()
-        if "ffmpeg" in blob and not _ffmpeg_available():
-            hint = (
-                " Install ffmpeg and ensure it is on PATH for best quality "
-                "(bv*+ba merges), or keep using single-file format fallback."
+        if player_clients:
+            args.extend(["--extractor-args", f"youtube:player_client={player_clients}"])
+        if sys.platform.startswith("win"):
+            args[0:0] = ["--windows-filenames"]
+        if extract_audio:
+            aq = (audio_quality or "0").strip() or "0"
+            args.extend(["-x", "--audio-format", "m4a", "--audio-quality", aq])
+        elif needs_merge:
+            args.extend(["--merge-output-format", "mkv"])
+        if sb_cats:
+            args.extend(["--sponsorblock-remove", sb_cats])
+        args.append(video_url)
+        return args
+
+    def _run_once(args: list[str]) -> Path | None:
+        cmd = [*_ytdlp_cmd(), *args]
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=_ssl_env(),
+                **_subprocess_hide_kwargs(),
             )
-        if "unavailable" in blob:
-            hint += " This video may be private, region-locked, or removed."
-        if "javascript runtime" in blob and not _js_runtime_args():
-            hint += " Install Node.js so yt-dlp can extract YouTube formats."
-        raise YtDlpError(f"yt-dlp failed (exit {code}): {detail}.{hint}".strip())
+        except FileNotFoundError as exc:
+            raise YtDlpError(f"yt-dlp not found ({' '.join(_ytdlp_cmd())})") from exc
+
+        if job_id is not None:
+            with _download_proc_lock:
+                _download_procs[int(job_id)] = proc
+
+        file_path: Path | None = None
+        tail: list[str] = []
+        code = -1
+        assert proc.stdout is not None
+        try:
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    tail.append(line)
+                    if len(tail) > 40:
+                        tail = tail[-40:]
+                match = PROGRESS_RE.search(line)
+                if match and progress_cb:
+                    try:
+                        progress_cb(float(match.group("pct")))
+                    except ValueError:
+                        pass
+                if line and not line.startswith("[") and Path(line).suffix and ("/" in line or "\\" in line):
+                    candidate = Path(line.strip())
+                    if candidate.suffix.lower() in {".mkv", ".mp4", ".webm", ".m4a", ".mp3", ".opus"}:
+                        file_path = candidate
+
+            code = proc.wait()
+        except Exception:
+            _kill_proc_tree(proc)
+            raise
+        finally:
+            if job_id is not None:
+                with _download_proc_lock:
+                    current = _download_procs.get(int(job_id))
+                    if current is proc:
+                        _download_procs.pop(int(job_id), None)
+
+        if job_id is not None:
+            with _download_proc_lock:
+                cancelled = int(job_id) in _killed_jobs
+                _killed_jobs.discard(int(job_id))
+            if cancelled:
+                raise YtDlpError("Cancelled")
+
+        if code != 0:
+            err_lines = [
+                ln
+                for ln in tail
+                if ln.startswith("ERROR:")
+                or "ERROR:" in ln
+                or ln.startswith("WARNING:")
+                or "ffmpeg" in ln.lower()
+            ]
+            detail = (
+                " | ".join(err_lines[-4:])
+                if err_lines
+                else (" | ".join(tail[-6:]) if tail else "no output")
+            )
+            hint = ""
+            blob = " ".join(tail).lower()
+            if _is_dpapi_cookie_error(blob):
+                raise YtDlpError(_enrich_ytdlp_error(detail or blob))
+            if "ffmpeg" in blob and not _ffmpeg_available():
+                hint = (
+                    " Install ffmpeg and ensure it is on PATH for best quality "
+                    "(bv*+ba merges), or keep using single-file format fallback."
+                )
+            if "unavailable" in blob or "private video" in blob:
+                hint += " This video may be private, region-locked, or removed."
+            if _is_player_client_retryable(blob):
+                cfg = get_config()
+                cookies_path = (cfg.ytdlp_cookies_path or "").strip()
+                cookies_ok = bool(cookies_path and Path(cookies_path).is_file())
+                if not cookies_ok and not (cfg.ytdlp_cookies_from_browser or "").strip():
+                    hint += (
+                        " YouTube may be blocking downloads — set cookies in "
+                        "Settings → Download Clients (prefer cookies.txt over "
+                        "Chrome/Edge cookies-from-browser on Windows)."
+                    )
+            if "javascript runtime" in blob and not _js_runtime_args():
+                hint += " Install Node.js so yt-dlp can extract YouTube formats."
+            raise YtDlpError(
+                _enrich_ytdlp_error(f"yt-dlp failed (exit {code}): {detail}.{hint}".strip())
+            )
+        return file_path
+
+    try:
+        path = _run_once(_build_args())
+    except YtDlpError as exc:
+        if str(exc).strip() == "Cancelled":
+            raise
+        if _is_browser_cookie_error(str(exc)):
+            try:
+                from . import applog
+
+                applog.log_error(
+                    "Browser cookies failed on download; retrying without cookies. "
+                    + _BROWSER_COOKIES_GUIDANCE,
+                    source="ytdlp",
+                )
+            except Exception:
+                pass
+            path = _run_once(_build_args(include_cookies=False))
+        elif not _is_player_client_retryable(str(exc)):
+            raise
+        else:
+            # One fallback with alternate YouTube player clients
+            path = _run_once(_build_args(player_clients="android,ios,mweb"))
     if progress_cb:
         progress_cb(100.0)
-    return file_path
+    return path
 
 
 def video_page_url(video_id: str) -> str:

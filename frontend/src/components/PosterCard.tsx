@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, type Source } from "../api";
 import { qualityLabel } from "../qualityOptions";
@@ -11,7 +11,29 @@ type PosterCardProps = {
 };
 
 export function PosterCard({ source, selectMode, selected, onToggleSelect }: PosterCardProps) {
+  const imgRef = useRef<HTMLImageElement | null>(null);
   const [artState, setArtState] = useState<"loading" | "loaded" | "failed">("loading");
+  const posterBust = source.poster_path || String(source.id);
+  const posterSrc = api.posterUrl(source.id, posterBust);
+
+  const syncArtState = useCallback((img: HTMLImageElement | null) => {
+    if (!img) return;
+    if (img.complete && img.naturalWidth > 0) setArtState("loaded");
+    else if (img.complete) setArtState("failed");
+    else setArtState("loading");
+  }, []);
+
+  useEffect(() => {
+    syncArtState(imgRef.current);
+  }, [posterSrc, syncArtState]);
+
+  const onImgRef = useCallback(
+    (node: HTMLImageElement | null) => {
+      imgRef.current = node;
+      syncArtState(node);
+    },
+    [syncArtState],
+  );
   const progress =
     source.video_count > 0
       ? `${source.downloaded_count}/${source.video_count}`
@@ -34,18 +56,14 @@ export function PosterCard({ source, selectMode, selected, onToggleSelect }: Pos
       ? "poster-status-wanted"
       : "poster-status-ok";
 
-  const posterBust = source.poster_path || String(source.id);
-  useEffect(() => {
-    setArtState("loading");
-  }, [source.id, posterBust]);
-
   const body = (
     <>
       <div className="poster-card-art">
         <img
-          src={api.posterUrl(source.id, posterBust)}
+          ref={onImgRef}
+          src={posterSrc}
           alt=""
-          style={{ display: artState === "loaded" ? "block" : "none" }}
+          className={artState === "loaded" ? "is-loaded" : undefined}
           onLoad={() => setArtState("loaded")}
           onError={() => setArtState("failed")}
         />
@@ -76,7 +94,7 @@ export function PosterCard({ source, selectMode, selected, onToggleSelect }: Pos
                 (source.nested_playlist_count ?? 0) === 1 ? "" : "s"
               }`
             : ""}{" "}
-          · {monitored ? "Monitored" : "Downloaded"}
+          · {monitored ? "Monitored" : "Unmonitored"}
         </div>
         <div className="poster-card-line muted">
           <span>{qualityLabel(source.quality, source.media_type)}</span>

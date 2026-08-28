@@ -5,6 +5,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+from sqlalchemy import exists
 from sqlalchemy.orm import Session
 
 from ..config import get_config, set_config
@@ -13,7 +14,7 @@ from ..models import DownloadJob, MonitoredSource, Video, VideoStatus
 from . import quality, ytdlp
 
 
-_lock = threading.Lock()
+_lock = threading.RLock()
 _active = 0
 
 # Refuse to start a download if free space is below this (bytes)
@@ -25,12 +26,8 @@ def _find_downloaded_file(
     *,
     prefer_dirs: list[Path] | None = None,
 ) -> Path | None:
-    cfg = get_config()
+    """Look for a completed file under the show folder only — never the whole library."""
     needles = (f"[{video_id}]", f"({video_id})")
-    roots: list[Path] = []
-    for p in list(prefer_dirs or []) + [Path(cfg.library_root), Path(cfg.music_library_root)]:
-        if p not in roots:
-            roots.append(p)
 
     def _scan(root: Path, *, recursive: bool) -> Path | None:
         if not root.exists():
@@ -44,13 +41,13 @@ def _find_downloaded_file(
             return None
         return None
 
-    # Prefer source folder (shallow, then recursive) before whole-library rglob
+    seen: set[Path] = set()
     for root in prefer_dirs or []:
+        key = root.resolve() if root.exists() else root
+        if key in seen:
+            continue
+        seen.add(key)
         hit = _scan(root, recursive=False) or _scan(root, recursive=True)
-        if hit:
-            return hit
-    for root in (Path(cfg.library_root), Path(cfg.music_library_root)):
-        hit = _scan(root, recursive=True)
         if hit:
             return hit
     return None
@@ -84,12 +81,20 @@ def recover_interrupted_downloads() -> dict:
                 prefer: list[Path] = []
                 source = video.source or db.get(MonitoredSource, video.source_id)
                 if source:
+                    from . import rename
+
                     root = (
                         Path(get_config().music_library_root)
                         if (source.media_type or "video").strip().lower() == "audio"
                         else Path(get_config().library_root)
                     )
-                    prefer.append(root / source.folder_name)
+                    show = rename.show_folder_name(source)
+                    prefer.append(root / show)
+                    season = rename.season_number_for(source)
+                    prefer.append(root / show / f"Season {season:02d}")
+                    folder = (source.folder_name or "").strip()
+                    if folder and folder != show:
+                        prefer.append(root / folder)
                 existing = _find_downloaded_file(video.video_id, prefer_dirs=prefer)
             if existing is not None:
                 video.status = VideoStatus.DOWNLOADED.value
@@ -122,26 +127,35 @@ def recover_interrupted_downloads() -> dict:
         db.close()
 
 
-def enqueue_wanted(db: Session) -> int:
+def enqueue_wanted(db: Session, limit: int = 500) -> int:
+    """Queue wanted videos that do not already have an active download job."""
     cfg = get_config()
     if cfg.downloads_paused:
         return 0
-    videos = (
-        db.query(Video)
-        .filter(Video.status == VideoStatus.WANTED.value)
-        .order_by(Video.published_at.asc(), Video.id.asc())
-        .all()
-    )
-    count = 0
-    for video in videos:
-        video.status = VideoStatus.QUEUED.value
-        job = DownloadJob(video_id=video.id, status="queued", progress=0.0)
-        db.add(video)
-        db.add(job)
-        count += 1
-    if count:
-        db.commit()
-    return count
+    cap = max(1, min(int(limit), 2000))
+    with _lock:
+        has_active_job = exists().where(
+            DownloadJob.video_id == Video.id,
+            DownloadJob.status.in_(["queued", "downloading"]),
+        )
+        videos = (
+            db.query(Video)
+            .filter(Video.status == VideoStatus.WANTED.value)
+            .filter(~has_active_job)
+            .order_by(Video.published_at.asc(), Video.id.asc())
+            .limit(cap)
+            .all()
+        )
+        count = 0
+        for video in videos:
+            video.status = VideoStatus.QUEUED.value
+            job = DownloadJob(video_id=video.id, status="queued", progress=0.0)
+            db.add(video)
+            db.add(job)
+            count += 1
+        if count:
+            db.commit()
+        return count
 
 
 _progress_last: dict[int, tuple[float, float]] = {}  # job_id -> (monotonic_ts, pct)
@@ -182,6 +196,88 @@ def _is_disk_full_error(exc: Exception) -> bool:
     return any(n in msg for n in needles)
 
 
+def _is_permanent_download_error(msg: str) -> bool:
+    """True for removals/private — do not auto-retry."""
+    err_l = msg.lower()
+    permanent = (
+        "private video",
+        "has been removed",
+        "account associated with this video has been terminated",
+        "login required",
+        "sign in if you've been granted access",
+        "members-only",
+        "members only",
+        "join this channel",
+    )
+    if any(s in err_l for s in permanent):
+        return True
+    # "unavailable" alone is ambiguous (can be bot-check); only permanent when clearly removed
+    if "video unavailable" in err_l and any(
+        s in err_l for s in ("removed", "deleted", "terminated", "private")
+    ):
+        return True
+    return False
+
+
+def _is_auth_block_error(msg: str) -> bool:
+    err_l = msg.lower()
+    return any(
+        s in err_l
+        for s in (
+            "http error 403",
+            "403 forbidden",
+            "sign in to confirm",
+            "confirm you're not a bot",
+            "confirm you are not a bot",
+            "cookies",
+            "bot check",
+            "dpapi",
+            "app-bound",
+            "app_bound",
+        )
+    )
+
+
+# Backoff minutes by retry_count after a transient failure (before next auto requeue)
+_RETRY_BACKOFF_MINUTES = (15, 60, 360)
+_MAX_AUTO_RETRIES = 3
+
+
+def requeue_retryable_failures(db: Session) -> int:
+    """Promote aged transient FAILED videos back to WANTED (capped attempts)."""
+    now = datetime.utcnow()
+    failed = (
+        db.query(Video)
+        .filter(Video.status == VideoStatus.FAILED.value)
+        .order_by(Video.updated_at.asc())
+        .limit(50)
+        .all()
+    )
+    n = 0
+    for video in failed:
+        if _is_permanent_download_error(video.error or ""):
+            continue
+        if _is_auth_block_error(video.error or ""):
+            # Stay failed until user sets cookies and clicks Retry
+            continue
+        count = int(getattr(video, "retry_count", 0) or 0)
+        if count >= _MAX_AUTO_RETRIES:
+            continue
+        wait_m = _RETRY_BACKOFF_MINUTES[min(count, len(_RETRY_BACKOFF_MINUTES) - 1)]
+        updated = video.updated_at or video.created_at or now
+        age_m = (now - updated).total_seconds() / 60.0
+        if age_m < wait_m:
+            continue
+        video.status = VideoStatus.WANTED.value
+        video.error = None
+        video.retry_count = count + 1
+        db.add(video)
+        n += 1
+    if n:
+        db.commit()
+    return n
+
+
 def _pause_downloads(reason: str) -> None:
     cfg = get_config()
     if cfg.downloads_paused:
@@ -199,12 +295,24 @@ def _free_bytes(path: Path) -> int | None:
         return None
 
 
+def cancel_job_process(job_id: int) -> bool:
+    """Kill the yt-dlp process tree for a downloading job (if any)."""
+    return ytdlp.kill_download_process(job_id)
+
+
 def cancel_all_queued(db: Session) -> int:
-    """Cancel every queued job and mark those videos ignored (panic stop)."""
-    jobs = db.query(DownloadJob).filter(DownloadJob.status == "queued").all()
+    """Cancel every queued/downloading job and mark those videos ignored (panic stop)."""
+    jobs = (
+        db.query(DownloadJob)
+        .filter(DownloadJob.status.in_(["queued", "downloading"]))
+        .all()
+    )
     now = datetime.utcnow()
     n = 0
+    downloading_ids: list[int] = []
     for job in jobs:
+        if job.status == "downloading":
+            downloading_ids.append(job.id)
         job.status = "cancelled"
         job.finished_at = now
         job.error = "Cancelled (queue cleared)"
@@ -227,6 +335,8 @@ def cancel_all_queued(db: Session) -> int:
         db.add(video)
         n += 1
     db.commit()
+    for jid in downloading_ids:
+        ytdlp.kill_download_process(jid)
     return n
 
 
@@ -236,49 +346,60 @@ def process_next_download() -> bool:
     cfg = get_config()
     if cfg.downloads_paused:
         return False
-    with _lock:
-        if _active >= max(1, cfg.concurrent_downloads):
-            return False
-        _active += 1
 
     db = SessionLocal()
     job: DownloadJob | None = None
     video: Video | None = None
+    claimed = False
     try:
-        job = (
-            db.query(DownloadJob)
-            .filter(DownloadJob.status == "queued")
-            .order_by(DownloadJob.id.asc())
-            .first()
-        )
-        if not job:
-            enqueue_wanted(db)
+        with _lock:
+            if _active >= max(1, cfg.concurrent_downloads):
+                return False
             job = (
                 db.query(DownloadJob)
                 .filter(DownloadJob.status == "queued")
                 .order_by(DownloadJob.id.asc())
                 .first()
             )
-        if not job:
-            return False
+            if not job:
+                enqueue_wanted(db)
+                job = (
+                    db.query(DownloadJob)
+                    .filter(DownloadJob.status == "queued")
+                    .order_by(DownloadJob.id.asc())
+                    .first()
+                )
+            if not job:
+                return False
 
-        video = db.get(Video, job.video_id)
-        if not video:
-            job.status = "failed"
-            job.error = "Video missing"
-            job.finished_at = datetime.utcnow()
-            db.add(job)
-            db.commit()
-            return True
+            video = db.get(Video, job.video_id)
+            if not video:
+                job.status = "failed"
+                job.error = "Video missing"
+                job.finished_at = datetime.utcnow()
+                db.add(job)
+                db.commit()
+                return True
 
-        # Selection/ignore must win — never start (or restart) ignored items
-        if video.status == VideoStatus.IGNORED.value:
-            job.status = "cancelled"
-            job.finished_at = datetime.utcnow()
-            job.error = "Ignored — not selected for download"
+            # Selection/ignore must win — never start (or restart) ignored items
+            if video.status == VideoStatus.IGNORED.value:
+                job.status = "cancelled"
+                job.finished_at = datetime.utcnow()
+                job.error = "Ignored — not selected for download"
+                db.add(job)
+                db.commit()
+                return True
+
+            job.status = "downloading"
+            job.started_at = datetime.utcnow()
+            job.progress = 0.0
+            video.status = VideoStatus.DOWNLOADING.value
+            video.error = None
             db.add(job)
+            db.add(video)
             db.commit()
-            return True
+            _active += 1
+            claimed = True
 
         source = db.get(MonitoredSource, video.source_id)
         media_type = (source.media_type if source else "video") or "video"
@@ -330,15 +451,6 @@ def process_next_download() -> bool:
             db.commit()
             return True
 
-        job.status = "downloading"
-        job.started_at = datetime.utcnow()
-        job.progress = 0.0
-        video.status = VideoStatus.DOWNLOADING.value
-        video.error = None
-        db.add(job)
-        db.add(video)
-        db.commit()
-
         job_id = job.id
         video_id = video.video_id
         music_default = getattr(cfg, "default_music_quality", None) or "best"
@@ -384,6 +496,7 @@ def process_next_download() -> bool:
             extract_audio=extract_audio,
             audio_quality=audio_q,
             sponsorblock_categories=sb_cats,
+            job_id=job_id,
         )
 
         # refresh — honor cancel/ignore that happened during download
@@ -406,6 +519,7 @@ def process_next_download() -> bool:
             job.finished_at = datetime.utcnow()
             video.status = VideoStatus.DOWNLOADED.value
             video.error = None
+            video.retry_count = 0
             if file_path:
                 from . import musicbrainz, rename
 
@@ -424,11 +538,48 @@ def process_next_download() -> bool:
                         )
                     except Exception:
                         pass
+                elif not extract_audio and organized.exists() and not (video.description or "").strip():
+                    try:
+                        from . import ytdlp as ytdlp_svc
+
+                        desc = ytdlp_svc.fetch_video_description(video.video_id)
+                        if desc:
+                            video.description = desc
+                            from . import nfo
+
+                            nfo.write_video_nfo(organized, video, source, description=desc)
+                    except Exception:
+                        pass
             db.add(job)
             db.add(video)
             db.commit()
+            if file_path:
+                try:
+                    from . import plex
+
+                    plex.notify_library_changed(
+                        host_file_path=video.file_path or file_path,
+                        media_type=getattr(source, "media_type", "video") or "video",
+                    )
+                except Exception:
+                    pass
         return True
     except Exception as exc:  # noqa: BLE001
+        if str(exc).strip() == "Cancelled":
+            if job is not None:
+                job = db.get(DownloadJob, job.id) or job
+                job.status = "cancelled"
+                job.finished_at = job.finished_at or datetime.utcnow()
+                job.error = job.error or "Cancelled"
+                db.add(job)
+            if video is not None:
+                video = db.get(Video, video.id) or video
+                if video.status != VideoStatus.DOWNLOADED.value:
+                    video.status = VideoStatus.IGNORED.value
+                    video.error = "Cancelled"
+                    db.add(video)
+            db.commit()
+            return True
         if _is_disk_full_error(exc):
             _pause_downloads("disk full")
         if job is not None:
@@ -445,24 +596,25 @@ def process_next_download() -> bool:
         if video is not None:
             video = db.get(Video, video.id) or video
             if video.status != VideoStatus.IGNORED.value:
-                err_l = str(exc).lower()
-                # Permanent access issues — don't keep retrying as "failed"
-                if any(
-                    s in err_l
-                    for s in (
-                        "private video",
-                        "video unavailable",
-                        "has been removed",
-                        "account associated with this video has been terminated",
-                        "login required",
-                        "sign in if you've been granted access",
-                    )
-                ):
+                err_s = str(exc)
+                if _is_permanent_download_error(err_s):
                     video.status = VideoStatus.IGNORED.value
                 else:
                     video.status = VideoStatus.FAILED.value
-                video.error = str(exc)
+                    if _is_auth_block_error(err_s) and "cookies" not in err_s.lower() and "dpapi" not in err_s.lower():
+                        err_s = (
+                            f"{err_s} — set cookies in Settings → Download Clients "
+                            "(prefer cookies.txt; Chrome/Edge cookies-from-browser "
+                            "often fails with DPAPI on Windows), then Retry."
+                        )
+                video.error = err_s
                 db.add(video)
+                try:
+                    from . import notify
+
+                    notify.on_download_failure(title=video.title or video.video_id, error=err_s)
+                except Exception:
+                    pass
         try:
             from . import applog
 
@@ -479,8 +631,9 @@ def process_next_download() -> bool:
         return True
     finally:
         db.close()
-        with _lock:
-            _active = max(0, _active - 1)
+        if claimed:
+            with _lock:
+                _active = max(0, _active - 1)
 
 
 def worker_tick() -> None:
@@ -491,6 +644,7 @@ def worker_tick() -> None:
 
     db = SessionLocal()
     try:
+        requeue_retryable_failures(db)
         enqueue_wanted(db)
     finally:
         db.close()

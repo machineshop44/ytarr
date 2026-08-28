@@ -11,6 +11,8 @@ const empty: Settings = {
   music_library_root: "",
   ytdlp_path: "yt-dlp",
   ffmpeg_path: "",
+  ytdlp_cookies_path: "",
+  ytdlp_cookies_from_browser: "",
   default_quality: "best",
   default_music_quality: "best",
   format: "bv*+ba/b",
@@ -26,6 +28,16 @@ const empty: Settings = {
   sponsorblock_categories_music:
     "music_offtopic,sponsor,selfpromo,interaction,intro,outro",
   path_mappings: [],
+  plex_enabled: false,
+  plex_url: "http://127.0.0.1:32400",
+  plex_token: "",
+  plex_video_section_id: "",
+  plex_music_section_id: "",
+  plex_refresh_debounce_seconds: 45,
+  connect_webhook_url: "",
+  connect_on_download: true,
+  connect_on_failure: true,
+  connect_on_grab: false,
   api_key: "",
   api_auth_required: true,
   authentication_method: "forms",
@@ -33,7 +45,12 @@ const empty: Settings = {
   has_password: false,
 };
 
-export type SettingsSection = "mediamanagement" | "quality" | "downloadclients" | "general";
+export type SettingsSection =
+  | "mediamanagement"
+  | "quality"
+  | "downloadclients"
+  | "connect"
+  | "general";
 
 const SECTION_TITLES: Record<SettingsSection, { title: string; blurb: string }> = {
   mediamanagement: {
@@ -47,6 +64,10 @@ const SECTION_TITLES: Record<SettingsSection, { title: string; blurb: string }> 
   downloadclients: {
     title: "Download Clients",
     blurb: "Built-in yt-dlp client (no SABnzbd/qBittorrent) — paths and concurrency.",
+  },
+  connect: {
+    title: "Connect",
+    blurb: "Plex library refresh after import (Arr Connect) and optional Discord/webhook notifications.",
   },
   general: {
     title: "General",
@@ -65,6 +86,9 @@ export function SettingsPage({ section = "mediamanagement" }: SettingsPageProps)
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [plexSections, setPlexSections] = useState<
+    { id: string; title: string; type: string; locations?: string[] }[]
+  >([]);
   const meta = SECTION_TITLES[section];
 
   useEffect(() => {
@@ -119,6 +143,22 @@ export function SettingsPage({ section = "mediamanagement" }: SettingsPageProps)
       while (host.endsWith(".")) host = host.slice(0, -1).trimEnd();
       payload.host = host || "127.0.0.1";
       if (newPassword.trim()) payload.password = newPassword.trim();
+      const browser = String(payload.ytdlp_cookies_from_browser || "")
+        .trim()
+        .toLowerCase();
+      const cookiesPath = String(payload.ytdlp_cookies_path || "").trim();
+      if (["chrome", "edge", "brave", "chromium"].includes(browser) && !cookiesPath) {
+        const ok = window.confirm(
+          `${browser} cookies-from-browser often fails on Windows while the browser is open ` +
+            `(locked cookie DB) or with App-Bound encryption.\n\n` +
+            `Prefer: Cookies file = Netscape cookies.txt, and Cookies from browser = Off.\n\n` +
+            `Save anyway?`,
+        );
+        if (!ok) {
+          setBusy(false);
+          return;
+        }
+      }
       const saved = await api.updateSettings(payload);
       setForm(saved);
       setNewPassword("");
@@ -156,8 +196,15 @@ export function SettingsPage({ section = "mediamanagement" }: SettingsPageProps)
       setForm((prev) => ({
         ...prev,
         [key]:
-          key === "port" || key === "poll_interval_minutes" || key === "concurrent_downloads"
-            ? Number(value)
+          key === "port" ||
+          key === "poll_interval_minutes" ||
+          key === "concurrent_downloads" ||
+          key === "plex_refresh_debounce_seconds"
+            ? (() => {
+                if (value === "") return prev[key];
+                const n = Number(value);
+                return Number.isFinite(n) ? n : prev[key];
+              })()
             : value,
       }));
     };
@@ -214,15 +261,19 @@ export function SettingsPage({ section = "mediamanagement" }: SettingsPageProps)
             <div className="panel" style={{ margin: "0 0 1rem", background: "var(--bg)" }}>
               <h3 style={{ marginTop: 0 }}>Plex tip</h3>
               <p className="muted" style={{ marginBottom: "0.5rem" }}>
-                Point a separate Plex library at your video library root. Use Local Media Assets /
-                Personal Media so each channel folder uses <span className="mono">poster.jpg</span>.
-                Keep YouTube out of Sonarr and your main TV library.
+                Point a separate Plex <strong>Home Videos</strong> library at your video library
+                root. Enable Local Media Assets so each channel uses{" "}
+                <span className="mono">poster.jpg</span> and per-file{" "}
+                <span className="mono">.nfo</span> synopsis. Keep YouTube out of Sonarr and your
+                main TV library.
               </p>
               <p className="muted" style={{ marginBottom: 0 }}>
-                Video series use date-based files:{" "}
-                <span className="mono">Channel/YYYY-MM-DD - Title [youtubeId].ext</span>. Music uses{" "}
-                <span className="mono">Artist/Title.ext</span> with MusicBrainz tags embedded on
-                download (no YouTube id in the filename). Change the disk under{" "}
+                Video files organize to{" "}
+                <span className="mono">
+                  Channel/Season XX/Show - SxxExx - Title [youtubeId].ext
+                </span>
+                . Music uses <span className="mono">Artist/Title.ext</span> with MusicBrainz tags
+                embedded on download (no YouTube id in the filename). Change the disk under{" "}
                 <strong>System → Root Folders</strong> if the library lives on another drive.
               </p>
             </div>
@@ -315,6 +366,49 @@ export function SettingsPage({ section = "mediamanagement" }: SettingsPageProps)
                 placeholder="tools/ffmpeg/ffmpeg.exe (bundled)"
               />
             </div>
+            <div className="field">
+              <label htmlFor="ytdlp_cookies_path">Cookies file (optional)</label>
+              <input
+                id="ytdlp_cookies_path"
+                value={form.ytdlp_cookies_path || ""}
+                onChange={set("ytdlp_cookies_path")}
+                placeholder="C:\path\to\cookies.txt"
+              />
+              <p className="muted" style={{ margin: "0.35rem 0 0", fontSize: "0.82rem" }}>
+                Preferred on Windows. Export a Netscape cookies.txt (e.g. extension
+                &quot;Get cookies.txt LOCALLY&quot;) while signed into YouTube. When this
+                file exists, it overrides Cookies from browser.
+              </p>
+            </div>
+            <div className="field">
+              <label htmlFor="ytdlp_cookies_from_browser">Cookies from browser (optional)</label>
+              <select
+                id="ytdlp_cookies_from_browser"
+                value={form.ytdlp_cookies_from_browser || ""}
+                onChange={set("ytdlp_cookies_from_browser")}
+              >
+                <option value="">Off</option>
+                <option value="chrome">Chrome</option>
+                <option value="edge">Edge</option>
+                <option value="firefox">Firefox</option>
+                <option value="brave">Brave</option>
+              </select>
+              {["chrome", "edge", "brave", "chromium"].includes(
+                (form.ytdlp_cookies_from_browser || "").toLowerCase(),
+              ) && !(form.ytdlp_cookies_path || "").trim() ? (
+                <div className="error" style={{ marginTop: "0.5rem" }}>
+                  <strong>{(form.ytdlp_cookies_from_browser || "").toUpperCase()}</strong> while
+                  open often blocks yt-dlp (cannot copy cookie DB). Prefer a cookies.txt file +
+                  Off, or use Firefox. Leave Off unless you need age-restricted / members videos.
+                </div>
+              ) : (
+                <p className="muted" style={{ margin: "0.35rem 0 0", fontSize: "0.82rem" }}>
+                  Leave Off for normal public channels. Use a cookies.txt file when YouTube
+                  blocks downloads; Firefox is the safest browser option if you must use
+                  cookies-from-browser.
+                </p>
+              )}
+            </div>
             <div className="field grow">
               <label htmlFor="concurrent">Concurrent downloads</label>
               <input
@@ -371,6 +465,236 @@ export function SettingsPage({ section = "mediamanagement" }: SettingsPageProps)
                 </div>
               </>
             )}
+          </>
+        )}
+
+        {section === "connect" && (
+          <>
+            <h3 style={{ marginTop: 0 }}>Plex Media Server</h3>
+            <p className="muted" style={{ marginTop: 0 }}>
+              After a download, rename, or delete-with-files, ytarr asks Plex to refresh the matching
+              library (same idea as Sonarr → Connect → Plex).
+            </p>
+            <label className="mode-option" style={{ marginBottom: "1rem" }}>
+              <input
+                type="checkbox"
+                checked={Boolean(form.plex_enabled)}
+                onChange={(e) => setForm((prev) => ({ ...prev, plex_enabled: e.target.checked }))}
+              />
+              <span>
+                <strong>Enable Plex Connect</strong>
+                <small>Debounced refresh so burst downloads do not spam Plex.</small>
+              </span>
+            </label>
+            <div className="field">
+              <label htmlFor="plex_url">Plex URL</label>
+              <input
+                id="plex_url"
+                value={form.plex_url || ""}
+                onChange={set("plex_url")}
+                placeholder="http://127.0.0.1:32400"
+              />
+            </div>
+            <div className="field">
+              <label htmlFor="plex_token">Plex token</label>
+              <input
+                id="plex_token"
+                type="password"
+                autoComplete="off"
+                value={form.plex_token || ""}
+                onChange={set("plex_token")}
+                placeholder="X-Plex-Token"
+              />
+              <p className="muted" style={{ margin: "0.35rem 0 0", fontSize: "0.82rem" }}>
+                From plex.tv/claim or your Plex account XML (support article: finding an
+                authentication token).
+              </p>
+            </div>
+            <div className="field">
+              <label htmlFor="plex_video_section">Video library section</label>
+              <select
+                id="plex_video_section"
+                value={form.plex_video_section_id || ""}
+                onChange={set("plex_video_section_id")}
+              >
+                <option value="">— select —</option>
+                {plexSections.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.title} ({s.type}) #{s.id}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="field">
+              <label htmlFor="plex_music_section">Music library section</label>
+              <select
+                id="plex_music_section"
+                value={form.plex_music_section_id || ""}
+                onChange={set("plex_music_section_id")}
+              >
+                <option value="">— select —</option>
+                {plexSections.map((s) => (
+                  <option key={`m-${s.id}`} value={s.id}>
+                    {s.title} ({s.type}) #{s.id}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="field">
+              <label htmlFor="plex_debounce">Refresh debounce (seconds)</label>
+              <input
+                id="plex_debounce"
+                type="number"
+                min={5}
+                max={300}
+                value={form.plex_refresh_debounce_seconds ?? 45}
+                onChange={set("plex_refresh_debounce_seconds")}
+              />
+            </div>
+            <div className="toolbar" style={{ marginBottom: "1.25rem" }}>
+              <button
+                type="button"
+                className="btn"
+                disabled={busy}
+                onClick={() => {
+                  void (async () => {
+                    setBusy(true);
+                    setError(null);
+                    setMessage(null);
+                    try {
+                      // Save first so test uses current form values from disk... use live form via PUT
+                      await api.updateSettings({
+                        plex_enabled: form.plex_enabled,
+                        plex_url: form.plex_url,
+                        plex_token: form.plex_token,
+                        plex_video_section_id: form.plex_video_section_id,
+                        plex_music_section_id: form.plex_music_section_id,
+                        plex_refresh_debounce_seconds: form.plex_refresh_debounce_seconds,
+                      });
+                      const res = await api.plexTest();
+                      if (!res.ok) {
+                        setError(res.error || "Plex test failed");
+                        return;
+                      }
+                      setPlexSections(res.sections || []);
+                      setMessage(
+                        `Plex OK — ${res.section_count ?? (res.sections || []).length} library section(s).`,
+                      );
+                    } catch (err) {
+                      setError(err instanceof Error ? err.message : String(err));
+                    } finally {
+                      setBusy(false);
+                    }
+                  })();
+                }}
+              >
+                Test Plex
+              </button>
+              <button
+                type="button"
+                className="btn"
+                disabled={busy}
+                onClick={() => {
+                  void (async () => {
+                    setBusy(true);
+                    setError(null);
+                    try {
+                      await api.updateSettings({
+                        plex_url: form.plex_url,
+                        plex_token: form.plex_token,
+                      });
+                      const res = await api.plexSections();
+                      setPlexSections(res.sections || []);
+                      setMessage(`Loaded ${res.sections.length} section(s).`);
+                    } catch (err) {
+                      setError(err instanceof Error ? err.message : String(err));
+                    } finally {
+                      setBusy(false);
+                    }
+                  })();
+                }}
+              >
+                Load sections
+              </button>
+              <button
+                type="button"
+                className="btn btn-primary"
+                disabled={busy || !form.plex_enabled}
+                onClick={() => {
+                  void (async () => {
+                    setBusy(true);
+                    setError(null);
+                    setMessage(null);
+                    try {
+                      await api.updateSettings({
+                        plex_enabled: form.plex_enabled,
+                        plex_url: form.plex_url,
+                        plex_token: form.plex_token,
+                        plex_video_section_id: form.plex_video_section_id,
+                        plex_music_section_id: form.plex_music_section_id,
+                      });
+                      const [v, a] = await Promise.all([
+                        api.plexRefresh("video"),
+                        api.plexRefresh("audio"),
+                      ]);
+                      setMessage(
+                        `Plex refresh requested — video ok=${String(Boolean(v.ok))}, music ok=${String(Boolean(a.ok))}.`,
+                      );
+                    } catch (err) {
+                      setError(err instanceof Error ? err.message : String(err));
+                    } finally {
+                      setBusy(false);
+                    }
+                  })();
+                }}
+              >
+                Refresh Plex now
+              </button>
+            </div>
+
+            <h3>Webhook / Discord</h3>
+            <p className="muted" style={{ marginTop: 0 }}>
+              Optional Discord-compatible webhook on grab, import, and download failure.
+            </p>
+            <div className="field">
+              <label htmlFor="webhook">Webhook URL</label>
+              <input
+                id="webhook"
+                value={form.connect_webhook_url || ""}
+                onChange={set("connect_webhook_url")}
+                placeholder="https://discord.com/api/webhooks/…"
+              />
+            </div>
+            <label className="check-row">
+              <input
+                type="checkbox"
+                checked={form.connect_on_grab === true}
+                onChange={(e) =>
+                  setForm((prev) => ({ ...prev, connect_on_grab: e.target.checked }))
+                }
+              />
+              <span>Notify on grab (Interactive Search)</span>
+            </label>
+            <label className="mode-option">
+              <input
+                type="checkbox"
+                checked={form.connect_on_download !== false}
+                onChange={(e) =>
+                  setForm((prev) => ({ ...prev, connect_on_download: e.target.checked }))
+                }
+              />
+              <span>Notify on import</span>
+            </label>
+            <label className="mode-option" style={{ marginBottom: "1rem" }}>
+              <input
+                type="checkbox"
+                checked={form.connect_on_failure !== false}
+                onChange={(e) =>
+                  setForm((prev) => ({ ...prev, connect_on_failure: e.target.checked }))
+                }
+              />
+              <span>Notify on download failure</span>
+            </label>
           </>
         )}
 

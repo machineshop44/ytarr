@@ -18,6 +18,13 @@ ytdlp_path: yt-dlp
 # Empty = auto-detect tools/ffmpeg inside this app, then PATH.
 # Or set a path relative to the app folder, e.g. tools/ffmpeg/ffmpeg.exe
 ffmpeg_path: tools/ffmpeg/ffmpeg.exe
+# Optional Netscape cookies.txt / browser cookies for YouTube bot/age gates.
+# Prefer cookies.txt on Windows: Chrome/Edge --cookies-from-browser often fails
+# with DPAPI / App-Bound encryption (yt-dlp#10927) or a locked cookie DB while
+# Chrome is open (yt-dlp#7271). When cookies_path exists, ytarr uses it and
+# ignores cookies_from_browser. Catalog fetches retry without cookies on failure.
+# ytdlp_cookies_path: "C:/path/to/cookies.txt"
+# ytdlp_cookies_from_browser: ""   # chrome | edge | firefox | brave (firefox safest)
 # Named preset: best | 2160p | 1080p | 720p | 480p | worst | custom
 default_quality: best
 # Music bitrate: best | 320k | 192k | 128k | 64k | worst | custom
@@ -26,7 +33,7 @@ default_music_quality: best
 format: bv*+ba/b
 # Used when default_music_quality / music source quality is "custom"
 music_format: ba/b
-# Plex Personal Media date-based: Channel/YYYY-MM-DD - Title [id].ext
+# Plex Home Videos: organized after download to Channel/Season XX/Show - SxxExx - Title [id].ext
 output_template: '%(uploader,playlist_title|Unknown)s/%(upload_date>%Y-%m-%d)s - %(title).200B [%(id)s].%(ext)s'
 music_output_template: '%(uploader,artist|Unknown)s/%(title).200B.%(ext)s'
 poll_interval_minutes: 30
@@ -36,3 +43,15 @@ nocheck_certificates: false
 sponsorblock_remove: true
 sponsorblock_categories_video: sponsor,selfpromo,interaction,intro,outro
 sponsorblock_categories_music: music_offtopic,sponsor,selfpromo,interaction,intro,outro
+# Plex Connect — refresh library after download / rename / delete-with-files
+plex_enabled: false
+plex_url: http://127.0.0.1:32400
+# plex_token: ""   # Settings → Account → Show more → plex.tv token, or XML from plex.tv/claim
+plex_video_section_id: ""
+plex_music_section_id: ""
+plex_refresh_debounce_seconds: 45
+# Discord-compatible webhook (Connect notifications)
+# connect_webhook_url: ""
+connect_on_download: true
+connect_on_failure: true
+connect_on_grab: false

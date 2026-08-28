@@ -12,8 +12,10 @@ export function DashboardPage() {
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [busyAction, setBusyAction] = useState<"update" | "art" | null>(null);
   const [sort, setSort] = useState<SortKey>("title");
   const [filter, setFilter] = useState<FilterKey>("all");
+  const [tagFilter, setTagFilter] = useState("");
   const [mediaFilter, setMediaFilter] = useState<MediaFilter>("all");
   const [query, setQuery] = useState("");
   const [editMode, setEditMode] = useState(false);
@@ -45,10 +47,18 @@ export function DashboardPage() {
       }
     };
     void tick();
-    const id = window.setInterval(tick, 5000);
+    const id = window.setInterval(() => {
+      if (document.hidden) return;
+      void tick();
+    }, 15000);
+    const onVis = () => {
+      if (!document.hidden) void tick();
+    };
+    document.addEventListener("visibilitychange", onVis);
     return () => {
       alive = false;
       window.clearInterval(id);
+      document.removeEventListener("visibilitychange", onVis);
     };
   }, []);
 
@@ -75,6 +85,15 @@ export function DashboardPage() {
     if (filter === "monitored") list = list.filter((s) => s.enabled);
     if (filter === "unmonitored") list = list.filter((s) => !s.enabled);
     if (filter === "wanted") list = list.filter((s) => s.wanted_count > 0);
+    if (tagFilter) {
+      list = list.filter((s) =>
+        (s.tags || "")
+          .split(",")
+          .map((t) => t.trim())
+          .filter(Boolean)
+          .includes(tagFilter),
+      );
+    }
     list = [...list].sort((a, b) => {
       if (sort === "wanted") return b.wanted_count - a.wanted_count || a.title.localeCompare(b.title);
       if (sort === "downloaded")
@@ -82,7 +101,18 @@ export function DashboardPage() {
       return a.title.localeCompare(b.title);
     });
     return list;
-  }, [sources, sort, filter, mediaFilter, query]);
+  }, [sources, sort, filter, mediaFilter, query, tagFilter]);
+
+  const allTags = useMemo(() => {
+    const found = new Set<string>();
+    for (const s of sources) {
+      for (const part of (s.tags || "").split(",")) {
+        const t = part.trim();
+        if (t) found.add(t);
+      }
+    }
+    return [...found].sort((a, b) => a.localeCompare(b));
+  }, [sources]);
 
   // Drop selections that are no longer in the filtered list
   useEffect(() => {
@@ -136,6 +166,7 @@ export function DashboardPage() {
 
   const refreshAll = async () => {
     setBusy(true);
+    setBusyAction("update");
     setError(null);
     setMessage(null);
     try {
@@ -147,11 +178,13 @@ export function DashboardPage() {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
+      setBusyAction(null);
     }
   };
 
   const refreshArtworkAll = async () => {
     setBusy(true);
+    setBusyAction("art");
     setError(null);
     setMessage(null);
     try {
@@ -176,6 +209,7 @@ export function DashboardPage() {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
+      setBusyAction(null);
     }
   };
 
@@ -240,7 +274,7 @@ export function DashboardPage() {
         {!editMode && (
           <>
             <button className="btn" type="button" disabled={busy} onClick={() => void refreshAll()}>
-              {busy ? "Working…" : "Update All"}
+              {busyAction === "update" ? "Updating…" : "Update All"}
             </button>
             <button
               className="btn"
@@ -248,7 +282,7 @@ export function DashboardPage() {
               disabled={busy}
               onClick={() => void refreshArtworkAll()}
             >
-              Refresh Art
+              {busyAction === "art" ? "Refreshing…" : "Refresh Art"}
             </button>
             <Link className="btn btn-primary" to="/add">
               Add New
@@ -317,6 +351,21 @@ export function DashboardPage() {
           <option value="unmonitored">Unmonitored</option>
           <option value="wanted">Has wanted</option>
         </select>
+        {allTags.length > 0 && (
+          <select
+            className="toolbar-select"
+            value={tagFilter}
+            onChange={(e) => setTagFilter(e.target.value)}
+            aria-label="Tag"
+          >
+            <option value="">Tag: All</option>
+            {allTags.map((t) => (
+              <option key={t} value={t}>
+                {t}
+              </option>
+            ))}
+          </select>
+        )}
       </div>
 
       {error && <div className="error">{error}</div>}
@@ -328,7 +377,7 @@ export function DashboardPage() {
         </div>
       )}
 
-      {!loading && !libraryItems.length && !error && (
+      {!loading && !sources.length && !error && (
         <div className="panel empty-library">
           <h2 style={{ marginTop: 0 }}>Library is empty</h2>
           <p className="muted">
@@ -338,6 +387,25 @@ export function DashboardPage() {
           <Link className="btn btn-primary" to="/add">
             Add New
           </Link>
+        </div>
+      )}
+
+      {!loading && sources.length > 0 && !libraryItems.length && !error && (
+        <div className="panel empty-library">
+          <h2 style={{ marginTop: 0 }}>No matches</h2>
+          <p className="muted">Nothing matches the current search or filters.</p>
+          <button
+            className="btn"
+            type="button"
+            onClick={() => {
+              setQuery("");
+              setFilter("all");
+              setMediaFilter("all");
+              setTagFilter("");
+            }}
+          >
+            Clear filters
+          </button>
         </div>
       )}
 

@@ -1,0 +1,13 @@
+﻿---
+description: Always copy Windows installers to Google Drive on build
+alwaysApply: true
+---
+
+# ytarr release / Drive copy
+
+When building a Windows installer (`scripts/build-exe.ps1` or equivalent):
+
+- Always copy the finished installer to `G:\My Drive\exe\` (script default).
+- Do **not** pass `-NoCopyToDrive` unless the user explicitly says to skip Drive.
+- Do **not** wait for the user to ask to push/copy to Drive — do it as part of every build.
+- After a build, report the Drive path (e.g. `G:\My Drive\exe\ytarr-<version>-x64.exe`).

@@ -26,27 +26,125 @@ def _library_root_for(source: MonitoredSource) -> Path:
     return Path(cfg.library_root)
 
 
+def show_disk_folder(db: Session, source: MonitoredSource) -> str:
+    """On-disk show folder: parent channel for nested playlists."""
+    if source.parent_source_id and (source.source_type or "").lower() == "playlist":
+        parent = db.get(MonitoredSource, source.parent_source_id)
+        if parent:
+            return (parent.folder_name or parent.title or "Unknown").strip() or "Unknown"
+    return (source.folder_name or source.title or "Unknown").strip() or "Unknown"
+
+
+def ensure_source_season(db: Session, source: MonitoredSource) -> int:
+    """Assign Plex season numbers: channel Uploads=1, nested playlists=2+."""
+    if (source.media_type or "video").strip().lower() == "audio":
+        return int(getattr(source, "season_number", None) or 1)
+
+    st = (source.source_type or "").lower()
+    current = int(getattr(source, "season_number", None) or 0)
+
+    if st == "channel":
+        if current != 1:
+            source.season_number = 1
+            db.add(source)
+        return 1
+
+    if st == "playlist" and source.parent_source_id:
+        if current >= 2:
+            return current
+        used = {
+            int(row[0] or 0)
+            for row in db.query(MonitoredSource.season_number)
+            .filter(MonitoredSource.parent_source_id == source.parent_source_id)
+            .filter(MonitoredSource.id != source.id)
+            .all()
+        }
+        used.add(1)  # reserved for channel Uploads
+        n = 2
+        while n in used:
+            n += 1
+        source.season_number = n
+        db.add(source)
+        return n
+
+    if current < 1:
+        source.season_number = 1
+        db.add(source)
+        return 1
+    return current
+
+
+def refresh_episode_numbers(
+    db: Session,
+    source: MonitoredSource,
+    entries: list | None = None,
+) -> None:
+    """Set episode_number from playlist_index or uploads chronology (oldest = E01)."""
+    if (source.media_type or "video").strip().lower() == "audio":
+        return
+
+    videos = db.query(Video).filter(Video.source_id == source.id).all()
+    if not videos:
+        return
+
+    by_id = {e.video_id: e for e in entries} if entries else {}
+
+    if entries and any(getattr(e, "playlist_index", None) for e in entries):
+        for v in videos:
+            e = by_id.get(v.video_id)
+            if not e:
+                continue
+            pi = getattr(e, "playlist_index", None)
+            if pi is not None:
+                try:
+                    v.episode_number = int(pi)
+                except (TypeError, ValueError):
+                    pass
+            desc = getattr(e, "description", None)
+            if desc and not (v.description or "").strip():
+                v.description = str(desc).strip()
+            db.add(v)
+        return
+
+    # Already numbered (playlist batches) — don't overwrite with date order
+    if any(getattr(v, "episode_number", None) for v in videos):
+        return
+
+    # Channel Uploads / undated: oldest first → E01
+    ordered = sorted(
+        videos,
+        key=lambda v: (
+            v.published_at is None,
+            v.published_at or datetime.min,
+            v.id,
+        ),
+    )
+    for i, v in enumerate(ordered, start=1):
+        if v.episode_number != i:
+            v.episode_number = i
+            db.add(v)
+
+
 def ensure_artwork(
     db: Session,
     source: MonitoredSource,
     *,
     force: bool = True,
 ) -> MonitoredSource:
-    folder = _library_root_for(source) / source.folder_name
-    # Nested playlists often share the parent channel folder — don't clobber channel poster.jpg
+    folder = _library_root_for(source) / show_disk_folder(db, source)
+    # Nested playlists — don't clobber channel poster.jpg
     if source.parent_source_id and (source.source_type or "").lower() == "playlist":
         parent = db.get(MonitoredSource, source.parent_source_id)
-        if parent and parent.folder_name == source.folder_name:
-            if parent.poster_path and Path(parent.poster_path).is_file():
-                source.poster_path = parent.poster_path
-                source.fanart_path = parent.fanart_path or parent.poster_path
-                db.add(source)
-                db.commit()
-                db.refresh(source)
-                return source
-            folder = folder / "_playlist_art" / ytdlp._safe_folder_name(
-                source.yt_id or f"playlist-{source.id}"
-            )
+        if parent and parent.poster_path and Path(parent.poster_path).is_file() and not force:
+            source.poster_path = parent.poster_path
+            source.fanart_path = parent.fanart_path or parent.poster_path
+            db.add(source)
+            db.commit()
+            db.refresh(source)
+            return source
+        folder = folder / "_playlist_art" / ytdlp._safe_folder_name(
+            source.yt_id or f"playlist-{source.id}"
+        )
 
     existing_poster = Path(source.poster_path) if source.poster_path else folder / "poster.jpg"
     if not force and ytdlp.image_file_ok(existing_poster):
@@ -139,11 +237,19 @@ def cancel_jobs_for_video(db: Session, video: Video, *, reason: str = "Ignored")
         .all()
     )
     now = datetime.utcnow()
+    kill_ids: list[int] = []
     for job in jobs:
+        if job.status == "downloading":
+            kill_ids.append(job.id)
         job.status = "cancelled"
         job.finished_at = now
         job.error = reason
         db.add(job)
+    for jid in kill_ids:
+        try:
+            downloader.cancel_job_process(jid)
+        except Exception:
+            pass
     return len(jobs)
 
 
@@ -186,6 +292,29 @@ def apply_episode_selection(
     db.commit()
     downloader.enqueue_wanted(db)
     return {"wanted": wanted_n, "ignored": ignored_n}
+
+
+def refresh_source_metadata(db: Session, source: MonitoredSource) -> bool:
+    """Pull the YouTube About text / subscriber count for an existing source.
+
+    Sources added before this existed (or added from a search hit, which carries no
+    About text) have description NULL — this backfills them on demand.
+    """
+    info = ytdlp.resolve_source(source.url)
+    changed = False
+    # "" marks "asked YouTube, nothing there" so we stop re-fetching every visit.
+    new_desc = info.description if info.description is not None else ""
+    if (source.description or None) != (new_desc or None) or source.description is None:
+        source.description = new_desc
+        changed = True
+    if info.subscriber_count is not None and source.subscriber_count != info.subscriber_count:
+        source.subscriber_count = info.subscriber_count
+        changed = True
+    if changed:
+        db.add(source)
+        db.commit()
+        db.refresh(source)
+    return changed
 
 
 def add_source(
@@ -245,6 +374,9 @@ def add_source(
         changed = False
         if parent_id is not None and getattr(existing, "parent_source_id", None) != parent_id:
             existing.parent_source_id = parent_id
+            changed = True
+        if changed:
+            ensure_source_season(db, existing)
             changed = True
         if selective:
             source_id = existing.id
@@ -313,17 +445,30 @@ def add_source(
         quality=quality,
         media_type=media_type,
         parent_source_id=parent_id if source_type == "playlist" else None,
+        season_number=1,
         initialized=False,
+        description=info.description,
+        subscriber_count=info.subscriber_count,
     )
     db.add(source)
     db.commit()
     db.refresh(source)
+    ensure_source_season(db, source)
+    db.commit()
+    db.refresh(source)
 
-    folder = _library_root_for(source) / source.folder_name
+    show_folder = show_disk_folder(db, source)
+    folder = _library_root_for(source) / show_folder
     folder.mkdir(parents=True, exist_ok=True)
+    if (media_type or "video") != "audio":
+        season = int(getattr(source, "season_number", None) or 1)
+        (folder / f"Season {season:02d}").mkdir(parents=True, exist_ok=True)
 
     # Quick poster from known thumb so the UI has art immediately
-    if info.thumbnail_url:
+    # Nested playlists must not overwrite the channel poster.jpg
+    if info.thumbnail_url and not (
+        parent_id and source_type == "playlist"
+    ):
         poster = folder / "poster.jpg"
         saved = ytdlp.download_image(info.thumbnail_url, poster)
         if saved:
@@ -391,6 +536,77 @@ def add_source(
     return source
 
 
+_CATALOG_BATCH = 200
+
+
+def _ingest_new_entries(
+    db: Session,
+    source: MonitoredSource,
+    entries: list,
+    existing_on_source: set[str],
+    *,
+    wanted_ids: set[str] | None,
+    effective_mode: str,
+    is_initial: bool,
+) -> tuple[int, int, int, int]:
+    """Insert catalog rows that this source does not already have. Returns counts."""
+    created_wanted = created_seen = created_ignored = adopted = 0
+    if not entries:
+        return created_wanted, created_seen, created_ignored, adopted
+    twins = {
+        row.video_id: row
+        for row in db.query(Video)
+        .filter(
+            Video.video_id.in_([e.video_id for e in entries]),
+            Video.source_id != source.id,
+            Video.status == VideoStatus.DOWNLOADED.value,
+        )
+        .all()
+    }
+    for entry in entries:
+        if entry.video_id in existing_on_source:
+            continue
+        file_path: str | None = None
+        twin = twins.get(entry.video_id)
+        if twin and twin.file_path and Path(twin.file_path).exists():
+            status = VideoStatus.DOWNLOADED.value
+            file_path = twin.file_path
+            adopted += 1
+        elif wanted_ids is not None:
+            status = (
+                VideoStatus.WANTED.value
+                if entry.video_id in wanted_ids
+                else VideoStatus.IGNORED.value
+            )
+        elif effective_mode == "none":
+            status = VideoStatus.SEEN.value
+        elif is_initial and effective_mode == "new":
+            status = VideoStatus.SEEN.value
+        else:
+            status = VideoStatus.WANTED.value
+        video = Video(
+            source_id=source.id,
+            video_id=entry.video_id,
+            title=entry.title,
+            published_at=entry.published_at,
+            duration=entry.duration,
+            thumbnail_url=entry.thumbnail_url,
+            description=getattr(entry, "description", None),
+            episode_number=getattr(entry, "playlist_index", None),
+            file_path=file_path,
+            status=status,
+        )
+        db.add(video)
+        existing_on_source.add(entry.video_id)
+        if status == VideoStatus.WANTED.value:
+            created_wanted += 1
+        elif status == VideoStatus.IGNORED.value:
+            created_ignored += 1
+        elif status != VideoStatus.DOWNLOADED.value:
+            created_seen += 1
+    return created_wanted, created_seen, created_ignored, adopted
+
+
 def check_source(
     db: Session,
     source: MonitoredSource,
@@ -410,69 +626,55 @@ def check_source(
     list_limit: int | None = None
     if not is_initial and effective_mode == "new":
         list_limit = 40
-    entries = ytdlp.list_entries(source.url, limit=list_limit)
-    created_wanted = 0
-    created_seen = 0
-    created_ignored = 0
-    adopted = 0
-    # Per-source uniqueness — same YouTube id may also live under Uploads
+    ensure_source_season(db, source)
+    created_wanted = created_seen = created_ignored = adopted = 0
     existing_on_source = {
         row[0]
         for row in db.query(Video.video_id).filter(Video.source_id == source.id).all()
     }
-    # Adopt file/status from another source when already downloaded
-    twins = {
-        row.video_id: row
-        for row in db.query(Video)
-        .filter(
-            Video.video_id.in_([e.video_id for e in entries] or ["__none__"]),
-            Video.source_id != source.id,
-            Video.status == VideoStatus.DOWNLOADED.value,
-        )
-        .all()
-    }
+    entries_seen = 0
+    last_batch: list = []
 
-    for entry in entries:
-        if entry.video_id in existing_on_source:
-            continue
-        file_path: str | None = None
-        twin = twins.get(entry.video_id)
-        if twin and twin.file_path and Path(twin.file_path).exists():
-            status = VideoStatus.DOWNLOADED.value
-            file_path = twin.file_path
-            adopted += 1
-        elif wanted_ids is not None:
-            if entry.video_id in wanted_ids:
-                status = VideoStatus.WANTED.value
-            else:
-                status = VideoStatus.IGNORED.value
-        elif effective_mode == "none":
-            status = VideoStatus.SEEN.value
-        elif is_initial and effective_mode == "new":
-            status = VideoStatus.SEEN.value
-        else:
-            # "all", "video", or ongoing "new" after init → download new uploads
-            status = VideoStatus.WANTED.value
-        video = Video(
-            source_id=source.id,
-            video_id=entry.video_id,
-            title=entry.title,
-            published_at=entry.published_at,
-            duration=entry.duration,
-            thumbnail_url=entry.thumbnail_url,
-            file_path=file_path,
-            status=status,
+    def _apply(batch: list) -> None:
+        nonlocal created_wanted, created_seen, created_ignored, adopted, entries_seen, last_batch
+        last_batch = batch
+        entries_seen += len(batch)
+        w, s, i, a = _ingest_new_entries(
+            db,
+            source,
+            batch,
+            existing_on_source,
+            wanted_ids=wanted_ids,
+            effective_mode=effective_mode,
+            is_initial=is_initial,
         )
-        db.add(video)
-        existing_on_source.add(entry.video_id)
-        if status == VideoStatus.WANTED.value:
-            created_wanted += 1
-        elif status == VideoStatus.IGNORED.value:
-            created_ignored += 1
-        elif status == VideoStatus.DOWNLOADED.value:
-            pass
-        else:
-            created_seen += 1
+        created_wanted += w
+        created_seen += s
+        created_ignored += i
+        adopted += a
+
+    if list_limit is not None:
+        _apply(ytdlp.list_entries(source.url, limit=list_limit))
+        refresh_episode_numbers(db, source, last_batch)
+    else:
+        start = 1
+        while True:
+            end = start + _CATALOG_BATCH - 1
+            batch = ytdlp.list_entries(
+                source.url,
+                playlist_start=start,
+                playlist_end=end,
+            )
+            if not batch:
+                break
+            _apply(batch)
+            db.commit()
+            if len(batch) < _CATALOG_BATCH:
+                break
+            start += _CATALOG_BATCH
+        refresh_episode_numbers(db, source, last_batch if any(
+            getattr(e, "playlist_index", None) for e in last_batch
+        ) else None)
 
     source.last_checked = datetime.utcnow()
     if is_initial:
@@ -485,7 +687,7 @@ def check_source(
         raise
     return {
         "source_id": source.id,
-        "entries_seen": len(entries),
+        "entries_seen": entries_seen,
         "marked_seen": created_seen,
         "marked_wanted": created_wanted,
         "marked_ignored": created_ignored,
@@ -714,12 +916,21 @@ def link_orphan_playlists_fast(db: Session) -> int:
     return linked
 
 
-def link_orphan_playlists(db: Session) -> int:
+def link_orphan_playlists(
+    db: Session,
+    *,
+    scrape: bool = True,
+    max_channels: int | None = None,
+    skip_fast: bool = False,
+) -> int:
     """Attach standalone playlist sources to their parent channel when possible.
 
-    Fast title/id heuristics first, then each channel's live YouTube /playlists tab.
+    Fast title/id heuristics first, then (optionally) each channel's live YouTube
+    /playlists tab. ``max_channels`` caps how many channels are scraped.
     """
-    linked = link_orphan_playlists_fast(db)
+    linked = 0 if skip_fast else link_orphan_playlists_fast(db)
+    if not scrape:
+        return linked
 
     orphans = (
         db.query(MonitoredSource)
@@ -735,6 +946,8 @@ def link_orphan_playlists(db: Session) -> int:
     )
     if not channels:
         return linked
+    if max_channels is not None:
+        channels = channels[: max(0, int(max_channels))]
 
     for ch in channels:
         try:

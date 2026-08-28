@@ -27,6 +27,9 @@ class MonitoredSource(Base):
     title: Mapped[str] = mapped_column(String(512), nullable=False, default="Unknown")
     yt_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     source_type: Mapped[str] = mapped_column(String(32), nullable=False, default="channel")
+    # YouTube About text. NULL = never fetched; "" = fetched, channel has none.
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    subscriber_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     monitor_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="new")
     # Empty = inherit Settings default_quality
@@ -42,6 +45,10 @@ class MonitoredSource(Base):
         ForeignKey("monitored_sources.id", ondelete="SET NULL"),
         nullable=True,
     )
+    # Comma-separated labels (Arr Tags)
+    tags: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    # Plex Home Videos: channel Uploads = 1; nested playlists = 2, 3, …
+    season_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     last_checked: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     initialized: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
@@ -68,9 +75,14 @@ class Video(Base):
     published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     duration: Mapped[int | None] = mapped_column(Integer, nullable=True)
     thumbnail_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Playlist order (or channel uploads oldest→newest) for SxxExx
+    episode_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     file_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default=VideoStatus.SEEN.value)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Auto-retry attempts for transient FAILED downloads (manual Retry resets to 0)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow

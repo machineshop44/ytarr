@@ -43,8 +43,10 @@ def init_db() -> None:
     from . import models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
-    _ensure_sqlite_columns()
+    # Unique-constraint rebuild must run before column ensure — the rebuild used to
+    # drop newer columns (description / episode_number) when it ran after ALTER ADD.
     _migrate_video_unique_constraint()
+    _ensure_sqlite_columns()
     _ensure_indexes()
 
 
@@ -53,7 +55,11 @@ def _ensure_indexes() -> None:
     stmts = (
         "CREATE INDEX IF NOT EXISTS ix_videos_status ON videos (status)",
         "CREATE INDEX IF NOT EXISTS ix_videos_source_status ON videos (source_id, status)",
+        "CREATE INDEX IF NOT EXISTS ix_videos_source_published ON videos (source_id, published_at)",
+        "CREATE INDEX IF NOT EXISTS ix_videos_published_at ON videos (published_at)",
+        "CREATE INDEX IF NOT EXISTS ix_videos_updated_at ON videos (updated_at)",
         "CREATE INDEX IF NOT EXISTS ix_download_jobs_status ON download_jobs (status)",
+        "CREATE INDEX IF NOT EXISTS ix_download_jobs_video_status ON download_jobs (video_id, status)",
         "CREATE INDEX IF NOT EXISTS ix_monitored_sources_enabled ON monitored_sources (enabled)",
         "CREATE INDEX IF NOT EXISTS ix_monitored_sources_parent ON monitored_sources (parent_source_id)",
     )
@@ -69,6 +75,15 @@ def _ensure_sqlite_columns() -> None:
             "quality": "VARCHAR(32) NOT NULL DEFAULT ''",
             "media_type": "VARCHAR(16) NOT NULL DEFAULT 'video'",
             "parent_source_id": "INTEGER REFERENCES monitored_sources(id) ON DELETE SET NULL",
+            "tags": "VARCHAR(512) NOT NULL DEFAULT ''",
+            "season_number": "INTEGER NOT NULL DEFAULT 1",
+            "description": "TEXT",
+            "subscriber_count": "INTEGER",
+        },
+        "videos": {
+            "retry_count": "INTEGER NOT NULL DEFAULT 0",
+            "description": "TEXT",
+            "episode_number": "INTEGER",
         },
     }
     with engine.begin() as conn:
@@ -77,6 +92,8 @@ def _ensure_sqlite_columns() -> None:
                 row[1]
                 for row in conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
             }
+            if not existing:
+                continue
             for name, ddl in cols.items():
                 if name not in existing:
                     conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
@@ -107,9 +124,12 @@ def _migrate_video_unique_constraint() -> None:
                 published_at DATETIME,
                 duration INTEGER,
                 thumbnail_url VARCHAR(1024),
+                description TEXT,
+                episode_number INTEGER,
                 file_path VARCHAR(2048),
                 status VARCHAR(32) NOT NULL,
                 error TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
                 created_at DATETIME NOT NULL,
                 updated_at DATETIME NOT NULL,
                 FOREIGN KEY(source_id) REFERENCES monitored_sources (id) ON DELETE CASCADE,
@@ -117,13 +137,36 @@ def _migrate_video_unique_constraint() -> None:
             )
             """
         )
+        # Copy whatever the old table actually has — a DB old enough to still carry the
+        # legacy unique index may predate any of these columns, and selecting a missing
+        # one aborts startup. Fallbacks match the new table's defaults.
+        old_cols = {
+            row[1]
+            for row in conn.exec_driver_sql("PRAGMA table_info(videos)").fetchall()
+        }
+        fallbacks = {
+            "id": "NULL",
+            "source_id": "NULL",
+            "video_id": "NULL",
+            "title": "'Untitled'",
+            "published_at": "NULL",
+            "duration": "NULL",
+            "thumbnail_url": "NULL",
+            "description": "NULL",
+            "episode_number": "NULL",
+            "file_path": "NULL",
+            "status": "'wanted'",
+            "error": "NULL",
+            "retry_count": "0",
+            "created_at": "CURRENT_TIMESTAMP",
+            "updated_at": "CURRENT_TIMESTAMP",
+        }
+        targets = list(fallbacks)
+        selects = [name if name in old_cols else fallbacks[name] for name in targets]
         conn.exec_driver_sql(
-            """
-            INSERT INTO videos_new
-                (id, source_id, video_id, title, published_at, duration, thumbnail_url,
-                 file_path, status, error, created_at, updated_at)
-            SELECT id, source_id, video_id, title, published_at, duration, thumbnail_url,
-                   file_path, status, error, created_at, updated_at
+            f"""
+            INSERT INTO videos_new ({", ".join(targets)})
+            SELECT {", ".join(selects)}
             FROM videos
             ORDER BY id ASC
             """
