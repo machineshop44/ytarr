@@ -1,4 +1,4 @@
-import { type FormEvent, useEffect, useState } from "react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   api,
@@ -65,6 +65,7 @@ export function SystemPage({ section = "status" }: SystemPageProps) {
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const aliveRef = useRef(true);
 
   const load = async () => {
     const [h, d, s, st] = await Promise.all([
@@ -73,6 +74,7 @@ export function SystemPage({ section = "status" }: SystemPageProps) {
       api.settings(),
       api.systemStatus(),
     ]);
+    if (!aliveRef.current) return;
     setHealth(h);
     setDash(d);
     setSettings({ ...emptySettings(), ...s, path_mappings: s.path_mappings || [] });
@@ -81,22 +83,36 @@ export function SystemPage({ section = "status" }: SystemPageProps) {
 
   const loadLogs = async () => {
     const logs = await api.systemLogs();
+    if (!aliveRef.current) return;
     setLogText(logs.text);
     setLogPath(logs.path);
   };
 
   useEffect(() => {
-    let alive = true;
+    aliveRef.current = true;
     const tick = async () => {
       try {
         if (section === "logs") {
-          await loadLogs();
+          const logs = await api.systemLogs();
+          if (!aliveRef.current) return;
+          setLogText(logs.text);
+          setLogPath(logs.path);
         } else {
-          await load();
+          const [h, d, s, st] = await Promise.all([
+            api.health(),
+            api.dashboard(),
+            api.settings(),
+            api.systemStatus(),
+          ]);
+          if (!aliveRef.current) return;
+          setHealth(h);
+          setDash(d);
+          setSettings({ ...emptySettings(), ...s, path_mappings: s.path_mappings || [] });
+          setSysStatus(st);
         }
-        if (alive) setError(null);
+        if (aliveRef.current) setError(null);
       } catch (err) {
-        if (alive) setError(err instanceof Error ? err.message : String(err));
+        if (aliveRef.current) setError(err instanceof Error ? err.message : String(err));
       }
     };
     void tick();
@@ -104,7 +120,7 @@ export function SystemPage({ section = "status" }: SystemPageProps) {
       if (section === "status" || section === "logs") void tick();
     }, section === "logs" ? 5000 : 8000);
     return () => {
-      alive = false;
+      aliveRef.current = false;
       window.clearInterval(id);
     };
   }, [section]);

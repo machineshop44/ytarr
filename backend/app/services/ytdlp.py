@@ -1246,6 +1246,9 @@ def list_entries(
     args.append(url)
 
     timeout = 120 if (start is not None or end is not None) else 300
+    if start is not None and end is not None:
+        span = max(1, int(end) - int(start) + 1)
+        timeout = max(120, min(480, 60 + span * 2))
     result = _run(args, timeout=timeout)
     if result.returncode != 0:
         raise YtDlpError(_ytdlp_failure_message(result, "Failed to list entries"))

@@ -562,23 +562,17 @@ export function SettingsPage({ section = "mediamanagement" }: SettingsPageProps)
                     setError(null);
                     setMessage(null);
                     try {
-                      // Save first so test uses current form values from disk... use live form via PUT
-                      await api.updateSettings({
-                        plex_enabled: form.plex_enabled,
-                        plex_url: form.plex_url,
-                        plex_token: form.plex_token,
-                        plex_video_section_id: form.plex_video_section_id,
-                        plex_music_section_id: form.plex_music_section_id,
-                        plex_refresh_debounce_seconds: form.plex_refresh_debounce_seconds,
+                      const res = await api.plexTest({
+                        plex_url: form.plex_url || undefined,
+                        plex_token: form.plex_token || undefined,
                       });
-                      const res = await api.plexTest();
                       if (!res.ok) {
                         setError(res.error || "Plex test failed");
                         return;
                       }
                       setPlexSections(res.sections || []);
                       setMessage(
-                        `Plex OK — ${res.section_count ?? (res.sections || []).length} library section(s).`,
+                        `Plex OK — ${res.section_count ?? (res.sections || []).length} library section(s). Save to persist.`,
                       );
                     } catch (err) {
                       setError(err instanceof Error ? err.message : String(err));
@@ -599,13 +593,12 @@ export function SettingsPage({ section = "mediamanagement" }: SettingsPageProps)
                     setBusy(true);
                     setError(null);
                     try {
-                      await api.updateSettings({
-                        plex_url: form.plex_url,
-                        plex_token: form.plex_token,
+                      const res = await api.plexSections({
+                        plex_url: form.plex_url || undefined,
+                        plex_token: form.plex_token || undefined,
                       });
-                      const res = await api.plexSections();
                       setPlexSections(res.sections || []);
-                      setMessage(`Loaded ${res.sections.length} section(s).`);
+                      setMessage(`Loaded ${res.sections.length} section(s). Save to persist URL/token.`);
                     } catch (err) {
                       setError(err instanceof Error ? err.message : String(err));
                     } finally {

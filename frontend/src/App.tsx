@@ -71,7 +71,11 @@ export default function App() {
           setAuthUser(status.username);
         }
       } catch {
-        if (alive) setNeedsLogin(false);
+        // Fail closed when we cannot confirm auth — avoid opening the UI unlocked
+        if (alive) {
+          setNeedsLogin(true);
+          setAuthUser(null);
+        }
       } finally {
         if (alive) setAuthChecking(false);
       }
@@ -382,7 +386,7 @@ export default function App() {
         <main className="main">
           <Routes>
             <Route path="/" element={<DashboardPage />} />
-            <Route path="/channel/:sourceId" element={<ChannelDetailPage />} />
+            <Route path="/channel/:sourceId" element={<ChannelDetailPage key={location.pathname} />} />
             <Route path="/add" element={<AddNewPage />} />
             <Route path="/discover" element={<DiscoverPage />} />
             <Route path="/sources" element={<SourcesPage />} />

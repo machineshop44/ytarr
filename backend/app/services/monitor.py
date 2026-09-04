@@ -375,9 +375,25 @@ def add_source(
         if parent_id is not None and getattr(existing, "parent_source_id", None) != parent_id:
             existing.parent_source_id = parent_id
             changed = True
+        # Re-add with new options should update the existing row (not silently no-op)
+        if not selective:
+            if quality and (existing.quality or "") != quality:
+                existing.quality = quality
+                changed = True
+            if media_type and (existing.media_type or "video") != media_type:
+                existing.media_type = media_type
+                changed = True
+            if mode and mode != "video" and (existing.monitor_mode or "") != mode:
+                # Don't convert one-shot videos into channel monitors via URL re-add
+                if existing.monitor_mode != "video":
+                    existing.monitor_mode = mode
+                    existing.enabled = mode in {"new", "all"}
+                    changed = True
+            if title and (title or "").strip() and existing.title != title.strip():
+                existing.title = title.strip()
+                changed = True
         if changed:
             ensure_source_season(db, existing)
-            changed = True
         if selective:
             source_id = existing.id
             picks = list(wanted_video_ids or [])
@@ -735,9 +751,17 @@ def backfill_source(
     }
 
 
-def delete_source_files(source: MonitoredSource) -> dict:
-    """Delete on-disk folder / known file paths for a source (Sonarr-style delete files)."""
+def delete_source_files(source: MonitoredSource, db: Session | None = None) -> dict:
+    """Delete on-disk folder / known file paths for a source (Sonarr-style delete files).
+
+    Nested playlist seasons live under the parent channel folder
+    (``Channel/Season XX``) — never delete a sibling-named folder at library root.
+    """
     import shutil
+
+    from sqlalchemy.orm import object_session
+
+    from . import rename
 
     removed: list[str] = []
     errors: list[str] = []
@@ -745,24 +769,55 @@ def delete_source_files(source: MonitoredSource) -> dict:
 
     cfg = get_config()
     roots = [Path(cfg.library_root), Path(cfg.music_library_root)]
-    # Prefer the active media root first
     try:
         primary = _library_root_for(source)
         roots = [primary, *[r for r in roots if r != primary]]
     except Exception:
         pass
 
-    folder_name = (source.folder_name or "").strip()
-    if folder_name:
+    sess = db or object_session(source)
+    parent_id = getattr(source, "parent_source_id", None)
+    is_nested_playlist = (
+        (source.source_type or "") == "playlist" and parent_id is not None
+    )
+
+    targets: list[Path] = []
+    if is_nested_playlist:
+        show = show_disk_folder(sess, source) if sess else (
+            (source.folder_name or source.title or "Unknown").strip() or "Unknown"
+        )
+        season = int(getattr(source, "season_number", None) or 1)
+        season = max(1, min(season, 999))
         for root in roots:
-            folder = root / folder_name
-            if folder.exists() and folder.is_dir():
-                try:
-                    shutil.rmtree(folder)
-                    removed.append(str(folder))
-                    removed_dirs.append(folder)
-                except OSError as exc:
-                    errors.append(f"{folder}: {exc}")
+            targets.append(root / show / f"Season {season:02d}")
+            # Playlist art lives beside seasons, not inside them
+            art = root / show / "_playlist_art" / rename._safe_name(
+                source.folder_name or source.title or "playlist"
+            )
+            targets.append(art)
+    else:
+        show = show_disk_folder(sess, source) if sess else (
+            (source.folder_name or source.title or "Unknown").strip() or "Unknown"
+        )
+        for root in roots:
+            targets.append(root / show)
+            folder_name = (source.folder_name or "").strip()
+            if folder_name and folder_name != show:
+                targets.append(root / folder_name)
+
+    seen: set[str] = set()
+    for folder in targets:
+        key = str(folder).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if folder.exists() and folder.is_dir():
+            try:
+                shutil.rmtree(folder)
+                removed.append(str(folder))
+                removed_dirs.append(folder)
+            except OSError as exc:
+                errors.append(f"{folder}: {exc}")
 
     def _already_gone(path: Path) -> bool:
         try:
@@ -838,14 +893,14 @@ def delete_source_tree(
     for child in children:
         if delete_files:
             _ = list(child.videos)
-            fr = delete_source_files(child)
+            fr = delete_source_files(child, db)
             removed.extend(fr.get("removed") or [])
             errors.extend(fr.get("errors") or [])
         db.delete(child)
 
     if delete_files:
         _ = list(source.videos)
-        fr = delete_source_files(source)
+        fr = delete_source_files(source, db)
         removed.extend(fr.get("removed") or [])
         errors.extend(fr.get("errors") or [])
 
@@ -894,7 +949,9 @@ def link_orphan_playlists_fast(db: Session) -> int:
         parent: MonitoredSource | None = None
         title_key = (pl.title or "").strip().lower()
         title_hits = by_title.get(title_key) or []
-        if len(title_hits) == 1:
+        if len(title_hits) == 1 and _playlist_list_id(pl.url or ""):
+            # Title match alone is too loose when many channels exist — require a
+            # playlist list= id in the URL so we don't nest under the wrong channel.
             parent = title_hits[0]
         else:
             # Older adds sometimes stored the channel UC… id on the playlist row

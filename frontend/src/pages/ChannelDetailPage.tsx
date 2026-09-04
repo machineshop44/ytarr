@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   api,
@@ -70,6 +70,7 @@ export function ChannelDetailPage() {
   const [ixBusy, setIxBusy] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteFiles, setDeleteFiles] = useState(false);
+  const previewPollGen = useRef(0);
 
   // History
   const [historyJobs, setHistoryJobs] = useState<DownloadJob[]>([]);
@@ -173,28 +174,40 @@ export function ChannelDetailPage() {
     };
   }, [loadCore]);
 
+  // Cancel in-flight preview episode polls when leaving this series page
+  useEffect(() => {
+    return () => {
+      previewPollGen.current += 1;
+    };
+  }, [id]);
+
   // Quiet core refresh — do not re-run playlist waterfall when initialized flips
   useEffect(() => {
     let inFlight = false;
+    let alive = true;
+    const sourceId = id;
     const ms = source && !source.initialized ? 2000 : 8000;
-    const id = window.setInterval(() => {
-      if (inFlight || document.hidden) return;
+    const tick = () => {
+      if (inFlight || document.hidden || !alive) return;
       inFlight = true;
       void loadCore()
         .catch(() => undefined)
         .finally(() => {
           inFlight = false;
         });
-    }, ms);
+    };
+    const timer = window.setInterval(tick, ms);
     const onVis = () => {
-      if (!document.hidden && !inFlight) void loadCore().catch(() => undefined);
+      if (!document.hidden && !inFlight && alive) void loadCore().catch(() => undefined);
     };
     document.addEventListener("visibilitychange", onVis);
     return () => {
-      window.clearInterval(id);
+      alive = false;
+      window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVis);
+      void sourceId;
     };
-  }, [loadCore, source?.initialized]);
+  }, [loadCore, source?.initialized, id]);
 
   const loadHistory = useCallback(async (sourceIds: number[], opts?: { quiet?: boolean }) => {
     if (!opts?.quiet) setHistoryLoading(true);
@@ -246,7 +259,12 @@ export function ChannelDetailPage() {
       .then((updated) => {
         if (!cancelled) setSource(updated);
       })
-      .catch(() => undefined);
+      .catch(() => {
+        // Mark as looked-up-empty so we stop showing "Loading…" forever
+        if (!cancelled) {
+          setSource((prev) => (prev && prev.id === id ? { ...prev, description: "" } : prev));
+        }
+      });
     return () => {
       cancelled = true;
     };
@@ -384,14 +402,19 @@ export function ChannelDetailPage() {
 
   const collapseAllSeasons = () => setExpandedKeys(new Set());
 
-  const runToolbar = async (key: string, fn: () => Promise<void>, okMsg: string) => {
+  const runToolbar = async (
+    key: string,
+    fn: () => Promise<void>,
+    okMsg: string,
+    opts?: { skipReload?: boolean },
+  ) => {
     setBusyKey(key);
     setError(null);
     setMessage(null);
     try {
       await fn();
       setMessage(okMsg);
-      await loadCore();
+      if (!opts?.skipReload) await loadCore();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -446,7 +469,7 @@ export function ChannelDetailPage() {
     if (!source) return;
     setEditTitle(source.title);
     setEditEnabled(source.enabled);
-    setEditMode(source.monitor_mode === "video" ? "all" : source.monitor_mode);
+    setEditMode(source.monitor_mode || "all");
     setEditQuality(source.quality || "");
     setEditMediaType(source.media_type || "video");
     setEditTags(source.tags || "");
@@ -458,14 +481,18 @@ export function ChannelDetailPage() {
     setBusyKey("edit");
     setError(null);
     try {
-      const updated = await api.patchSource(source.id, {
+      const body: Parameters<typeof api.patchSource>[1] = {
         title: editTitle.trim() || source.title,
         enabled: editEnabled,
-        monitor_mode: editMode,
         quality: editQuality,
         media_type: editMediaType,
         tags: editTags,
-      });
+      };
+      // Never convert a one-shot video into full catalog monitoring via Edit
+      if (source.monitor_mode !== "video") {
+        body.monitor_mode = editMode;
+      }
+      const updated = await api.patchSource(source.id, body);
       setSource(updated);
       setEditOpen(false);
       setMessage("Series settings saved.");
@@ -539,6 +566,7 @@ export function ChannelDetailPage() {
         navigate("/");
       },
       deleteFiles ? "Removed series and deleted files." : "Removed from library (files kept).",
+      { skipReload: true },
     );
   };
 
@@ -595,12 +623,11 @@ export function ChannelDetailPage() {
         ) {
           return;
         }
-        await api.patchSource(existing.id, { enabled: true, monitor_mode: "new" });
-        // Nest under this channel so it does not get a duplicate library poster
-        await api.addSource(hit.url, "new", {
+        await api.patchSource(existing.id, {
+          enabled: true,
+          monitor_mode: "new",
           parent_source_id: channelId,
-          title: hit.title,
-          yt_id: hit.id,
+          title: hit.title || existing.title,
         });
         await api.checkSource(existing.id);
         await kickQueue();
@@ -694,11 +721,15 @@ export function ChannelDetailPage() {
       setMessage(`Queued “${entry.title}” for download.`);
       await loadCore();
       // Selective add already syncs in the background — poll the DB, don't re-checkSource.
+      const pollId = ++previewPollGen.current;
       for (let i = 0; i < 10; i++) {
+        if (previewPollGen.current !== pollId) return;
         const vids = await loadAlbumTracks(created.id);
+        if (previewPollGen.current !== pollId) return;
         if (vids.some((v) => v.video_id === entry.video_id)) break;
         await new Promise((r) => setTimeout(r, 700));
       }
+      if (previewPollGen.current !== pollId) return;
       setExpandedKeys((prev) => new Set(prev).add(key));
     } catch (err) {
       setPreviewPicked((prev) => {
@@ -942,13 +973,13 @@ export function ChannelDetailPage() {
       <section
         className="series-hero"
         style={{
-          backgroundImage: `linear-gradient(90deg, rgba(10,16,20,0.92) 0%, rgba(10,16,20,0.72) 45%, rgba(10,16,20,0.55) 100%), url(${api.fanartUrl(source.id)})`,
+          backgroundImage: `linear-gradient(90deg, rgba(10,16,20,0.92) 0%, rgba(10,16,20,0.72) 45%, rgba(10,16,20,0.55) 100%), url(${api.fanartUrl(source.id, source.fanart_path || source.poster_path || source.id)})`,
         }}
       >
         <div className="series-hero-inner">
           <div className="channel-hero-art">
             {source.poster_path ? (
-              <img src={api.posterUrl(source.id)} alt="" />
+              <img src={api.posterUrl(source.id, source.poster_path)} alt="" />
             ) : (
               <div className="poster-card-placeholder">No poster</div>
             )}
@@ -1184,7 +1215,7 @@ export function ChannelDetailPage() {
                   </td>
                   <td className="mono muted">
                     {job.status === "downloading" || job.status === "queued"
-                      ? `${job.progress.toFixed(0)}%`
+                      ? `${(Number(job.progress) || 0).toFixed(0)}%`
                       : "—"}
                   </td>
                   <td className="mono muted">
@@ -1333,9 +1364,17 @@ export function ChannelDetailPage() {
                   id="edit-mode"
                   value={editMode}
                   onChange={(e) => setEditMode(e.target.value)}
+                  disabled={source.monitor_mode === "video"}
                 >
-                  <option value="all">All — download catalog + future</option>
-                  <option value="new">Future — new uploads only</option>
+                  {source.monitor_mode === "video" ? (
+                    <option value="video">One-shot video</option>
+                  ) : (
+                    <>
+                      <option value="all">All — download catalog + future</option>
+                      <option value="new">Future — new uploads only</option>
+                      <option value="none">None — structure only</option>
+                    </>
+                  )}
                 </select>
               </div>
               <div className="field">

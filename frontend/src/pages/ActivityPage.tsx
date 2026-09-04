@@ -66,12 +66,15 @@ export function ActivityPage({ tab = "queue" }: ActivityPageProps) {
             setError(null);
           }
         } else {
-          const data =
+          const [data, dash] = await Promise.all([
             tab === "queue"
-              ? await api.queue({ status: "active", limit: 200 })
-              : await api.queue({ status: "history", limit: 100 });
+              ? api.queue({ status: "active", limit: 200 })
+              : api.queue({ status: "history", limit: 100 }),
+            api.dashboard(),
+          ]);
           if (alive) {
             setJobs(data);
+            setPaused(Boolean(dash.downloads_paused));
             setError(null);
           }
         }
@@ -83,6 +86,9 @@ export function ActivityPage({ tab = "queue" }: ActivityPageProps) {
       }
     };
     setLoading(true);
+    if (tab === "queue") setJobs([]);
+    if (tab === "history") setJobs([]);
+    if (tab === "blocklist") setBlocklist([]);
     void tick();
     const id = window.setInterval(tick, tab === "blocklist" ? 10000 : 2500);
     return () => {
@@ -273,10 +279,10 @@ export function ActivityPage({ tab = "queue" }: ActivityPageProps) {
                   </td>
                   {tab === "queue" ? (
                     <td>
-                      <div className="progress" title={`${job.progress.toFixed(1)}%`}>
-                        <span style={{ width: `${Math.min(100, Math.max(0, job.progress))}%` }} />
+                      <div className="progress" title={`${(Number(job.progress) || 0).toFixed(1)}%`}>
+                        <span style={{ width: `${Math.min(100, Math.max(0, Number(job.progress) || 0))}%` }} />
                       </div>
-                      <div className="muted mono">{job.progress.toFixed(1)}%</div>
+                      <div className="muted mono">{(Number(job.progress) || 0).toFixed(1)}%</div>
                     </td>
                   ) : (
                     <td className="mono muted">

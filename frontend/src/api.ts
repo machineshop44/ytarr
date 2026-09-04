@@ -393,6 +393,7 @@ export const api = {
       quality?: string;
       media_type?: string;
       tags?: string;
+      parent_source_id?: number;
     },
   ) =>
     request<Source>(`/api/sources/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
@@ -470,10 +471,11 @@ export const api = {
     const q = params.toString();
     return `/api/sources/${id}/poster${q ? `?${q}` : ""}`;
   },
-  fanartUrl: (id: number) => {
+  fanartUrl: (id: number, bust?: string | number) => {
     const params = new URLSearchParams();
     const key = getApiKey();
     if (key) params.set("apikey", key);
+    if (bust != null && String(bust)) params.set("v", String(bust));
     const q = params.toString();
     return `/api/sources/${id}/fanart${q ? `?${q}` : ""}`;
   },
@@ -488,17 +490,30 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
-  plexSections: () =>
+  plexSections: (opts?: { plex_url?: string; plex_token?: string }) =>
     request<{ sections: { id: string; title: string; type: string; locations: string[] }[] }>(
       "/api/connect/plex/sections",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          plex_url: opts?.plex_url ?? null,
+          plex_token: opts?.plex_token ?? null,
+        }),
+      },
     ),
-  plexTest: () =>
+  plexTest: (opts?: { plex_url?: string; plex_token?: string }) =>
     request<{
       ok: boolean;
       error?: string;
       section_count?: number;
       sections?: { id: string; title: string; type: string }[];
-    }>("/api/connect/plex/test", { method: "POST" }),
+    }>("/api/connect/plex/test", {
+      method: "POST",
+      body: JSON.stringify({
+        plex_url: opts?.plex_url ?? null,
+        plex_token: opts?.plex_token ?? null,
+      }),
+    }),
   plexRefresh: (mediaType: "video" | "audio" = "video") =>
     request<Record<string, unknown>>(
       `/api/connect/plex/refresh?media_type=${encodeURIComponent(mediaType)}`,

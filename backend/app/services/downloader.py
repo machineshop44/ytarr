@@ -411,7 +411,8 @@ def process_next_download() -> bool:
             library_root = Path(cfg.library_root)
             output_template = cfg.output_template
 
-        # Same YouTube id already downloaded under another season — reuse file
+        # Same YouTube id already downloaded under another season — copy into this
+        # show folder so delete-files on one source cannot orphan the other.
         twin = (
             db.query(Video)
             .filter(
@@ -423,12 +424,30 @@ def process_next_download() -> bool:
             .first()
         )
         if twin and twin.file_path and Path(twin.file_path).exists():
+            import shutil
+
+            from . import rename
+
+            twin_path = Path(twin.file_path)
+            dest = twin_path
+            try:
+                # Copy first so organize never moves the twin's only file
+                tmp = twin_path.parent / f".ytarr-twin-{video.video_id}{twin_path.suffix}"
+                shutil.copy2(twin_path, tmp)
+                dest = rename.organize_downloaded_file(db, video, source, tmp)
+                if dest.exists() and tmp.exists() and dest.resolve() != tmp.resolve():
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+            except Exception:
+                dest = twin_path
             job.status = "completed"
             job.progress = 100.0
             job.finished_at = datetime.utcnow()
             job.error = None
             video.status = VideoStatus.DOWNLOADED.value
-            video.file_path = twin.file_path
+            video.file_path = str(dest)
             video.error = None
             db.add(job)
             db.add(video)
@@ -453,9 +472,14 @@ def process_next_download() -> bool:
 
         job_id = job.id
         video_id = video.video_id
+        source_id = video.source_id
         music_default = getattr(cfg, "default_music_quality", None) or "best"
         music_fmt = getattr(cfg, "music_format", None) or "ba/b"
         src_quality = source.quality if source else ""
+        media_type_snap = media_type
+        extract_audio_snap = extract_audio
+        library_root_snap = library_root
+        output_template_snap = output_template
         fmt = quality.resolve_format_selector(
             src_quality,
             default_quality=cfg.default_quality,
@@ -469,13 +493,6 @@ def process_next_download() -> bool:
             else "0"
         )
 
-        def on_progress(pct: float) -> None:
-            s = SessionLocal()
-            try:
-                _set_progress(s, job_id, pct)
-            finally:
-                s.close()
-
         sb_cats: str | None = None
         if getattr(cfg, "sponsorblock_remove", True):
             if extract_audio:
@@ -487,21 +504,37 @@ def process_next_download() -> bool:
                     "sponsor,selfpromo,interaction,intro,outro"
                 )
 
+        # Release the DB connection for the long yt-dlp run
+        db.close()
+        db = None  # type: ignore[assignment]
+
+        def on_progress(pct: float) -> None:
+            s = SessionLocal()
+            try:
+                _set_progress(s, job_id, pct)
+            finally:
+                s.close()
+
         file_path = ytdlp.download_video(
             ytdlp.video_page_url(video_id),
-            library_root=library_root,
-            output_template=output_template,
+            library_root=library_root_snap,
+            output_template=output_template_snap,
             format_selector=fmt,
             progress_cb=on_progress,
-            extract_audio=extract_audio,
+            extract_audio=extract_audio_snap,
             audio_quality=audio_q,
             sponsorblock_categories=sb_cats,
             job_id=job_id,
         )
 
-        # refresh — honor cancel/ignore that happened during download
+        db = SessionLocal()
         job = db.get(DownloadJob, job_id)
         video = db.get(Video, job.video_id) if job else None
+        source = db.get(MonitoredSource, source_id) if video else None
+        extract_audio = extract_audio_snap
+        library_root = library_root_snap
+
+        # refresh — honor cancel/ignore that happened during download
         if job and video:
             if job.status == "cancelled" or video.status == VideoStatus.IGNORED.value:
                 job.status = "cancelled"
@@ -514,107 +547,141 @@ def process_next_download() -> bool:
                 db.add(video)
                 db.commit()
                 return True
+            # yt-dlp can exit 0 without printing a filepath — recover or fail cleanly
+            resolved: Path | None = Path(file_path) if file_path else None
+            if resolved is None or not resolved.exists():
+                prefer: list[Path] = []
+                if source:
+                    from . import rename
+
+                    show = rename.show_folder_name(source)
+                    prefer.append(library_root / show)
+                    prefer.append(
+                        library_root / show / f"Season {rename.season_number_for(source):02d}"
+                    )
+                    folder = (source.folder_name or "").strip()
+                    if folder and folder != show:
+                        prefer.append(library_root / folder)
+                resolved = _find_downloaded_file(video_id, prefer_dirs=prefer)
+            if resolved is None or not resolved.exists():
+                job.status = "failed"
+                job.finished_at = datetime.utcnow()
+                job.error = "Download finished but no media file was found on disk"
+                video.status = VideoStatus.FAILED.value
+                video.error = job.error
+                db.add(job)
+                db.add(video)
+                db.commit()
+                return True
+
             job.status = "completed"
             job.progress = 100.0
             job.finished_at = datetime.utcnow()
             video.status = VideoStatus.DOWNLOADED.value
             video.error = None
             video.retry_count = 0
-            if file_path:
-                from . import musicbrainz, rename
+            from . import musicbrainz, rename
 
-                organized = rename.organize_downloaded_file(
-                    db, video, source, Path(file_path)
-                )
-                video.file_path = str(organized)
-                if extract_audio and organized.exists():
-                    artist = rename.music_artist_folder(source, video, organized)
-                    try:
-                        musicbrainz.enrich_music_file(
-                            organized,
-                            title=video.title or organized.stem,
-                            artist=artist,
-                            youtube_id=video.video_id,
-                        )
-                    except Exception:
-                        pass
-                elif not extract_audio and organized.exists() and not (video.description or "").strip():
-                    try:
-                        from . import ytdlp as ytdlp_svc
-
-                        desc = ytdlp_svc.fetch_video_description(video.video_id)
-                        if desc:
-                            video.description = desc
-                            from . import nfo
-
-                            nfo.write_video_nfo(organized, video, source, description=desc)
-                    except Exception:
-                        pass
-            db.add(job)
-            db.add(video)
-            db.commit()
-            if file_path:
+            organized = rename.organize_downloaded_file(db, video, source, resolved)
+            video.file_path = str(organized)
+            if extract_audio and organized.exists():
+                artist = rename.music_artist_folder(source, video, organized)
                 try:
-                    from . import plex
-
-                    plex.notify_library_changed(
-                        host_file_path=video.file_path or file_path,
-                        media_type=getattr(source, "media_type", "video") or "video",
+                    musicbrainz.enrich_music_file(
+                        organized,
+                        title=video.title or organized.stem,
+                        artist=artist,
+                        youtube_id=video.video_id,
                     )
                 except Exception:
                     pass
+            elif not extract_audio and organized.exists() and not (video.description or "").strip():
+                try:
+                    from . import ytdlp as ytdlp_svc
+
+                    desc = ytdlp_svc.fetch_video_description(video.video_id)
+                    if desc:
+                        video.description = desc
+                        from . import nfo
+
+                        nfo.write_video_nfo(organized, video, source, description=desc)
+                except Exception:
+                    pass
+            db.add(job)
+            db.add(video)
+            db.commit()
+            try:
+                from . import plex
+
+                plex.notify_library_changed(
+                    host_file_path=video.file_path or str(organized),
+                    media_type=getattr(source, "media_type", "video") or "video",
+                )
+            except Exception:
+                pass
         return True
     except Exception as exc:  # noqa: BLE001
+        # Session may have been closed for the long yt-dlp run — reopen if needed
+        job_pk = getattr(job, "id", None) if job is not None else locals().get("job_id")
+        video_pk = getattr(video, "id", None) if video is not None else None
+        if db is None:
+            db = SessionLocal()
+        try:
+            if job_pk is not None:
+                job = db.get(DownloadJob, int(job_pk))
+            if video_pk is not None:
+                video = db.get(Video, int(video_pk))
+            elif job is not None:
+                video = db.get(Video, job.video_id)
+        except Exception:
+            pass
         if str(exc).strip() == "Cancelled":
             if job is not None:
-                job = db.get(DownloadJob, job.id) or job
                 job.status = "cancelled"
                 job.finished_at = job.finished_at or datetime.utcnow()
                 job.error = job.error or "Cancelled"
                 db.add(job)
-            if video is not None:
-                video = db.get(Video, video.id) or video
-                if video.status != VideoStatus.DOWNLOADED.value:
-                    video.status = VideoStatus.IGNORED.value
-                    video.error = "Cancelled"
-                    db.add(video)
+            if video is not None and video.status != VideoStatus.DOWNLOADED.value:
+                video.status = VideoStatus.IGNORED.value
+                video.error = "Cancelled"
+                db.add(video)
             db.commit()
             return True
         if _is_disk_full_error(exc):
             _pause_downloads("disk full")
-        if job is not None:
-            job = db.get(DownloadJob, job.id) or job
-            if job.status != "cancelled":
-                job.status = "failed"
-                job.error = str(exc)
-                if _is_disk_full_error(exc):
-                    job.error = (
-                        f"{exc} — downloads paused. Free disk space, then resume in Activity."
+        if job is not None and job.status != "cancelled":
+            job.status = "failed"
+            job.error = str(exc)
+            if _is_disk_full_error(exc):
+                job.error = (
+                    f"{exc} — downloads paused. Free disk space, then resume in Activity."
+                )
+            job.finished_at = datetime.utcnow()
+            db.add(job)
+        if video is not None and video.status != VideoStatus.IGNORED.value:
+            err_s = str(exc)
+            if _is_permanent_download_error(err_s):
+                video.status = VideoStatus.IGNORED.value
+            else:
+                video.status = VideoStatus.FAILED.value
+                if (
+                    _is_auth_block_error(err_s)
+                    and "cookies" not in err_s.lower()
+                    and "dpapi" not in err_s.lower()
+                ):
+                    err_s = (
+                        f"{err_s} — set cookies in Settings → Download Clients "
+                        "(prefer cookies.txt; Chrome/Edge cookies-from-browser "
+                        "often fails with DPAPI on Windows), then Retry."
                     )
-                job.finished_at = datetime.utcnow()
-                db.add(job)
-        if video is not None:
-            video = db.get(Video, video.id) or video
-            if video.status != VideoStatus.IGNORED.value:
-                err_s = str(exc)
-                if _is_permanent_download_error(err_s):
-                    video.status = VideoStatus.IGNORED.value
-                else:
-                    video.status = VideoStatus.FAILED.value
-                    if _is_auth_block_error(err_s) and "cookies" not in err_s.lower() and "dpapi" not in err_s.lower():
-                        err_s = (
-                            f"{err_s} — set cookies in Settings → Download Clients "
-                            "(prefer cookies.txt; Chrome/Edge cookies-from-browser "
-                            "often fails with DPAPI on Windows), then Retry."
-                        )
-                video.error = err_s
-                db.add(video)
-                try:
-                    from . import notify
+            video.error = err_s
+            db.add(video)
+            try:
+                from . import notify
 
-                    notify.on_download_failure(title=video.title or video.video_id, error=err_s)
-                except Exception:
-                    pass
+                notify.on_download_failure(title=video.title or video.video_id, error=err_s)
+            except Exception:
+                pass
         try:
             from . import applog
 
@@ -627,17 +694,31 @@ def process_next_download() -> bool:
             )
         except Exception:
             pass
-        db.commit()
+        try:
+            db.commit()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
         return True
     finally:
-        db.close()
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
         if claimed:
             with _lock:
                 _active = max(0, _active - 1)
 
 
 def worker_tick() -> None:
-    """Called by scheduler: enqueue wanted, then process downloads up to concurrency."""
+    """Called by scheduler: enqueue wanted, then start downloads up to concurrency.
+
+    Each download runs in its own daemon thread so concurrent_downloads > 1 is real.
+    ``process_next_download`` claims under ``_lock`` and is a no-op when slots are full.
+    """
     cfg = get_config()
     if cfg.downloads_paused:
         return
@@ -649,6 +730,11 @@ def worker_tick() -> None:
     finally:
         db.close()
 
-    for _ in range(max(1, cfg.concurrent_downloads)):
-        if not process_next_download():
-            break
+    with _lock:
+        slots = max(0, int(cfg.concurrent_downloads or 1) - _active)
+    for i in range(slots):
+        threading.Thread(
+            target=process_next_download,
+            name=f"ytarr-download-{i}",
+            daemon=True,
+        ).start()

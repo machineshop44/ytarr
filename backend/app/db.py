@@ -100,81 +100,94 @@ def _ensure_sqlite_columns() -> None:
 
 
 def _migrate_video_unique_constraint() -> None:
-    """Replace global video_id unique with (source_id, video_id) so playlists can list dupes."""
-    with engine.begin() as conn:
-        indexes = conn.exec_driver_sql("PRAGMA index_list(videos)").fetchall()
-        # row: (seq, name, unique, origin, partial)
-        index_names = {row[1] for row in indexes}
-        if "uq_videos_source_video" in index_names and "uq_videos_video_id" not in index_names:
-            return
+    """Replace global video_id unique with (source_id, video_id) so playlists can list dupes.
 
-        needs = "uq_videos_video_id" in index_names or "uq_videos_source_video" not in index_names
-        if not needs:
-            return
+    Must disable foreign_keys outside a transaction — SQLite ignores PRAGMA foreign_keys
+    changes that happen mid-transaction, and DROP TABLE videos would otherwise fail while
+    download_jobs still references it.
+    """
+    raw = engine.raw_connection()
+    try:
+        raw.isolation_level = None  # autocommit — required for PRAGMA foreign_keys
+        cur = raw.cursor()
+        try:
+            indexes = cur.execute("PRAGMA index_list(videos)").fetchall()
+            index_names = {row[1] for row in indexes}
+            if "uq_videos_source_video" in index_names and "uq_videos_video_id" not in index_names:
+                return
 
-        conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
-        conn.exec_driver_sql("DROP TABLE IF EXISTS videos_new")
-        conn.exec_driver_sql(
-            """
-            CREATE TABLE videos_new (
-                id INTEGER NOT NULL PRIMARY KEY,
-                source_id INTEGER NOT NULL,
-                video_id VARCHAR(64) NOT NULL,
-                title VARCHAR(512) NOT NULL,
-                published_at DATETIME,
-                duration INTEGER,
-                thumbnail_url VARCHAR(1024),
-                description TEXT,
-                episode_number INTEGER,
-                file_path VARCHAR(2048),
-                status VARCHAR(32) NOT NULL,
-                error TEXT,
-                retry_count INTEGER NOT NULL DEFAULT 0,
-                created_at DATETIME NOT NULL,
-                updated_at DATETIME NOT NULL,
-                FOREIGN KEY(source_id) REFERENCES monitored_sources (id) ON DELETE CASCADE,
-                CONSTRAINT uq_videos_source_video UNIQUE (source_id, video_id)
-            )
-            """
-        )
-        # Copy whatever the old table actually has — a DB old enough to still carry the
-        # legacy unique index may predate any of these columns, and selecting a missing
-        # one aborts startup. Fallbacks match the new table's defaults.
-        old_cols = {
-            row[1]
-            for row in conn.exec_driver_sql("PRAGMA table_info(videos)").fetchall()
-        }
-        fallbacks = {
-            "id": "NULL",
-            "source_id": "NULL",
-            "video_id": "NULL",
-            "title": "'Untitled'",
-            "published_at": "NULL",
-            "duration": "NULL",
-            "thumbnail_url": "NULL",
-            "description": "NULL",
-            "episode_number": "NULL",
-            "file_path": "NULL",
-            "status": "'wanted'",
-            "error": "NULL",
-            "retry_count": "0",
-            "created_at": "CURRENT_TIMESTAMP",
-            "updated_at": "CURRENT_TIMESTAMP",
-        }
-        targets = list(fallbacks)
-        selects = [name if name in old_cols else fallbacks[name] for name in targets]
-        conn.exec_driver_sql(
-            f"""
-            INSERT INTO videos_new ({", ".join(targets)})
-            SELECT {", ".join(selects)}
-            FROM videos
-            ORDER BY id ASC
-            """
-        )
-        conn.exec_driver_sql("DROP TABLE videos")
-        conn.exec_driver_sql("ALTER TABLE videos_new RENAME TO videos")
-        conn.exec_driver_sql(
-            "CREATE INDEX IF NOT EXISTS ix_videos_video_id ON videos (video_id)"
-        )
-        conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+            needs = "uq_videos_video_id" in index_names or "uq_videos_source_video" not in index_names
+            if not needs:
+                return
+
+            cur.execute("PRAGMA foreign_keys=OFF")
+            cur.execute("BEGIN")
+            try:
+                cur.execute("DROP TABLE IF EXISTS videos_new")
+                cur.execute(
+                    """
+                    CREATE TABLE videos_new (
+                        id INTEGER NOT NULL PRIMARY KEY,
+                        source_id INTEGER NOT NULL,
+                        video_id VARCHAR(64) NOT NULL,
+                        title VARCHAR(512) NOT NULL,
+                        published_at DATETIME,
+                        duration INTEGER,
+                        thumbnail_url VARCHAR(1024),
+                        description TEXT,
+                        episode_number INTEGER,
+                        file_path VARCHAR(2048),
+                        status VARCHAR(32) NOT NULL,
+                        error TEXT,
+                        retry_count INTEGER NOT NULL DEFAULT 0,
+                        created_at DATETIME NOT NULL,
+                        updated_at DATETIME NOT NULL,
+                        FOREIGN KEY(source_id) REFERENCES monitored_sources (id) ON DELETE CASCADE,
+                        CONSTRAINT uq_videos_source_video UNIQUE (source_id, video_id)
+                    )
+                    """
+                )
+                old_cols = {row[1] for row in cur.execute("PRAGMA table_info(videos)").fetchall()}
+                fallbacks = {
+                    "id": "NULL",
+                    "source_id": "NULL",
+                    "video_id": "NULL",
+                    "title": "'Untitled'",
+                    "published_at": "NULL",
+                    "duration": "NULL",
+                    "thumbnail_url": "NULL",
+                    "description": "NULL",
+                    "episode_number": "NULL",
+                    "file_path": "NULL",
+                    "status": "'wanted'",
+                    "error": "NULL",
+                    "retry_count": "0",
+                    "created_at": "CURRENT_TIMESTAMP",
+                    "updated_at": "CURRENT_TIMESTAMP",
+                }
+                targets = list(fallbacks)
+                selects = [name if name in old_cols else fallbacks[name] for name in targets]
+                cur.execute(
+                    f"""
+                    INSERT INTO videos_new ({", ".join(targets)})
+                    SELECT {", ".join(selects)}
+                    FROM videos
+                    ORDER BY id ASC
+                    """
+                )
+                cur.execute("DROP TABLE videos")
+                cur.execute("ALTER TABLE videos_new RENAME TO videos")
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS ix_videos_video_id ON videos (video_id)"
+                )
+                cur.execute("COMMIT")
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+            finally:
+                cur.execute("PRAGMA foreign_keys=ON")
+        finally:
+            cur.close()
+    finally:
+        raw.close()
 

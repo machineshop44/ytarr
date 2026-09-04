@@ -24,6 +24,29 @@ _PUBLIC_API_SUFFIXES = (
     "/api/auth/status",
 )
 
+# Login brute-force protection (in-memory; resets on restart)
+_LOGIN_FAILS: dict[str, list[float]] = {}
+_LOGIN_LOCKOUT_SEC = 300.0
+_LOGIN_MAX_FAILS = 8
+
+
+def login_is_locked(client_key: str) -> bool:
+    now = time.time()
+    hits = [t for t in _LOGIN_FAILS.get(client_key, []) if now - t < _LOGIN_LOCKOUT_SEC]
+    _LOGIN_FAILS[client_key] = hits
+    return len(hits) >= _LOGIN_MAX_FAILS
+
+
+def record_login_failure(client_key: str) -> None:
+    now = time.time()
+    hits = [t for t in _LOGIN_FAILS.get(client_key, []) if now - t < _LOGIN_LOCKOUT_SEC]
+    hits.append(now)
+    _LOGIN_FAILS[client_key] = hits
+
+
+def record_login_success(client_key: str) -> None:
+    _LOGIN_FAILS.pop(client_key, None)
+
 
 def hash_password(password: str, salt: bytes | None = None) -> str:
     salt = salt or secrets.token_bytes(16)
@@ -81,12 +104,13 @@ def parse_session_token(token: str) -> str | None:
         return None
 
 
-def set_session_cookie(response: Response, username: str) -> None:
+def set_session_cookie(response: Response, username: str, *, secure: bool = False) -> None:
     response.set_cookie(
         key=SESSION_COOKIE,
         value=create_session_token(username),
         httponly=True,
         samesite="lax",
+        secure=secure,
         max_age=SESSION_DAYS * 86400,
         path="/",
     )

@@ -25,6 +25,15 @@ log = logging.getLogger(__name__)
 _UA = "ytarr/0.1 (https://github.com/local/ytarr; music metadata)"
 _last_request = 0.0
 _CACHE: dict[str, "MusicBrainzMatch | None"] = {}
+_CACHE_MAX = 512
+
+
+def _cache_put(key: str, value: "MusicBrainzMatch | None") -> None:
+    if key in _CACHE:
+        _CACHE.pop(key, None)
+    _CACHE[key] = value
+    while len(_CACHE) > _CACHE_MAX:
+        _CACHE.pop(next(iter(_CACHE)), None)
 
 
 @dataclass
@@ -68,7 +77,9 @@ def lookup_recording(artist: str, title: str) -> MusicBrainzMatch | None:
 
     cache_key = f"{artist.lower()}::{title.lower()}"
     if cache_key in _CACHE:
-        return _CACHE[cache_key]
+        val = _CACHE.pop(cache_key)
+        _CACHE[cache_key] = val
+        return val
 
     # Prefer exact-ish recording + artist; fall back to looser query
     queries = [
@@ -121,7 +132,7 @@ def lookup_recording(artist: str, title: str) -> MusicBrainzMatch | None:
         log.warning("MusicBrainz lookup failed for %s — %s: %s", artist, title, exc)
         match = None
 
-    _CACHE[cache_key] = match
+    _cache_put(cache_key, match)
     return match
 
 

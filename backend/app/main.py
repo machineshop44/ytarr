@@ -36,11 +36,22 @@ async def lifespan(_app: FastAPI):
     init_db()
     # Failed videos are already in the DB / Activity — don't re-spam the log on every boot.
     try:
-        from .services import downloader
+        from .services import applog, downloader
 
-        downloader.recover_interrupted_downloads()
-    except Exception:
-        pass
+        recovered = downloader.recover_interrupted_downloads()
+        if recovered and (recovered.get("completed") or recovered.get("requeued")):
+            applog.log_info(
+                f"Startup recovery: completed={recovered.get('completed', 0)} "
+                f"requeued={recovered.get('requeued', 0)}",
+                source="startup",
+            )
+    except Exception as exc:
+        try:
+            from .services import applog
+
+            applog.log_error(f"Startup download recovery failed: {exc}", source="startup")
+        except Exception:
+            pass
     # Collapse existing playlist posters under their channel (once, in background).
     try:
         import threading
@@ -61,8 +72,14 @@ async def lifespan(_app: FastAPI):
                         f"Nested {n} playlist(s) under their channel in the library",
                         source="startup",
                     )
-            except Exception:
+            except Exception as exc:
                 s.rollback()
+                try:
+                    from .services import applog
+
+                    applog.log_error(f"Startup playlist link (fast) failed: {exc}", source="startup")
+                except Exception:
+                    pass
             finally:
                 s.close()
             # YouTube /playlists scrape is slow — don't block boot; cap channels.
@@ -79,14 +96,25 @@ async def lifespan(_app: FastAPI):
                         f"Nested {n2} more playlist(s) after YouTube playlist lookup",
                         source="startup",
                     )
-            except Exception:
+            except Exception as exc:
                 s2.rollback()
+                try:
+                    from .services import applog
+
+                    applog.log_error(f"Startup playlist link (scrape) failed: {exc}", source="startup")
+                except Exception:
+                    pass
             finally:
                 s2.close()
 
         threading.Thread(target=_link_playlists, name="ytarr-link-playlists", daemon=True).start()
-    except Exception:
-        pass
+    except Exception as exc:
+        try:
+            from .services import applog
+
+            applog.log_error(f"Startup playlist linker failed to start: {exc}", source="startup")
+        except Exception:
+            pass
     start_scheduler()
     try:
         yield
@@ -98,7 +126,7 @@ app = FastAPI(title="ytarr", version=app_version(), lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { api, type Video } from "../api";
 
 type LibraryPageProps = {
@@ -7,6 +7,7 @@ type LibraryPageProps = {
 };
 
 export function LibraryPage({ defaultStatus = "wanted" }: LibraryPageProps) {
+  const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const statusFromQuery = searchParams.get("status");
   const [videos, setVideos] = useState<Video[]>([]);
@@ -20,6 +21,13 @@ export function LibraryPage({ defaultStatus = "wanted" }: LibraryPageProps) {
   useEffect(() => {
     setStatus(statusFromQuery || defaultStatus);
   }, [defaultStatus, statusFromQuery]);
+
+  const setStatusAndUrl = (next: string) => {
+    setStatus(next);
+    if (next === "failed") navigate("/wanted/failed", { replace: true });
+    else if (next === "cutoff") navigate("/wanted/cutoff", { replace: true });
+    else navigate("/wanted", { replace: true });
+  };
 
   const load = async (nextStatus = status) => {
     setVideos(await api.videos(nextStatus === "all" ? undefined : { status: nextStatus }));
@@ -89,7 +97,7 @@ export function LibraryPage({ defaultStatus = "wanted" }: LibraryPageProps) {
             className="toolbar-select"
             style={{ width: 180 }}
             value={status}
-            onChange={(e) => setStatus(e.target.value)}
+            onChange={(e) => setStatusAndUrl(e.target.value)}
           >
             <option value="wanted">Wanted</option>
             <option value="cutoff">Cutoff Unmet</option>

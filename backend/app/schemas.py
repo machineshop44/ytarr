@@ -94,6 +94,7 @@ class SourceUpdate(BaseModel):
     quality: str | None = None
     media_type: str | None = Field(default=None, pattern="^(video|audio)$")
     tags: str | None = None
+    parent_source_id: int | None = None
 
 
 class SourceOut(BaseModel):
@@ -269,6 +270,13 @@ class SettingsUpdate(BaseModel):
 class LoginIn(BaseModel):
     username: str
     password: str
+
+
+class PlexProbeIn(BaseModel):
+    """Optional draft credentials for Test / Load without saving settings."""
+
+    plex_url: str | None = None
+    plex_token: str | None = None
 
 
 class LoginOut(BaseModel):

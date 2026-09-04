@@ -7,7 +7,7 @@ export function findExistingPlaylist(sources: Source[], hit: SearchHit): Source 
     if (s.source_type === "channel" || s.source_type === "video") return false;
     if (hit.url && urlsRoughlyEqual(s.url, hit.url)) return true;
     const sid = s.yt_id || playlistListId(s.url);
-    return Boolean(hitId && sid && (hitId === sid || hitId.startsWith(sid) || sid.startsWith(hitId)));
+    return Boolean(hitId && sid && hitId === sid);
   });
 }
 

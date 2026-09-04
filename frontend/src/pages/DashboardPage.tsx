@@ -232,8 +232,12 @@ export function DashboardPage() {
     try {
       for (let i = 0; i < ids.length; i++) {
         try {
-          await api.deleteSource(ids[i], { deleteFiles });
-          ok += 1;
+          const result = await api.deleteSource(ids[i], { deleteFiles });
+          if (result.errors?.length) {
+            failures.push(`${titles[i]}: ${result.errors.join("; ")}`);
+          } else {
+            ok += 1;
+          }
         } catch (err) {
           failures.push(
             `${titles[i]}: ${err instanceof Error ? err.message : String(err)}`,

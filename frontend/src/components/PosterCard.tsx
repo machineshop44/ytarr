@@ -24,6 +24,7 @@ export function PosterCard({ source, selectMode, selected, onToggleSelect }: Pos
   }, []);
 
   useEffect(() => {
+    setArtState("loading");
     syncArtState(imgRef.current);
   }, [posterSrc, syncArtState]);
 
@@ -59,15 +60,17 @@ export function PosterCard({ source, selectMode, selected, onToggleSelect }: Pos
   const body = (
     <>
       <div className="poster-card-art">
-        <img
-          ref={onImgRef}
-          src={posterSrc}
-          alt=""
-          className={artState === "loaded" ? "is-loaded" : undefined}
-          onLoad={() => setArtState("loaded")}
-          onError={() => setArtState("failed")}
-        />
-        {artState !== "loaded" && (
+        {source.poster_path ? (
+          <img
+            ref={onImgRef}
+            src={posterSrc}
+            alt=""
+            className={artState === "loaded" ? "is-loaded" : undefined}
+            onLoad={() => setArtState("loaded")}
+            onError={() => setArtState("failed")}
+          />
+        ) : null}
+        {(!source.poster_path || artState !== "loaded") && (
           <div className="poster-card-placeholder">
             {artState === "failed" || !source.poster_path ? "No poster" : ""}
           </div>

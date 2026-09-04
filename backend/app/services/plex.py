@@ -42,10 +42,13 @@ def _request(
     params: dict[str, str] | None = None,
     method: str = "GET",
     timeout: float = 30,
+    base_url: str | None = None,
+    token: str | None = None,
 ) -> tuple[int, bytes]:
     q = dict(params or {})
-    q["X-Plex-Token"] = _token()
-    url = f"{_base_url()}{path}?{urllib.parse.urlencode(q)}"
+    q["X-Plex-Token"] = (token if token is not None else _token()).strip()
+    root = (base_url if base_url is not None else _base_url()).strip().rstrip("/")
+    url = f"{root}{path}?{urllib.parse.urlencode(q)}"
     req = urllib.request.Request(
         url,
         method=method,
@@ -64,11 +67,17 @@ def _request(
         return int(exc.code), body or str(exc).encode()
 
 
-def list_sections() -> list[dict[str, Any]]:
+def list_sections(
+    *,
+    plex_url: str | None = None,
+    plex_token: str | None = None,
+) -> list[dict[str, Any]]:
     """Return Plex library sections (id, title, type, locations)."""
-    if not _token() or not _base_url():
+    base = (plex_url if plex_url is not None else _base_url()).strip().rstrip("/")
+    tok = (plex_token if plex_token is not None else _token()).strip()
+    if not tok or not base:
         raise ValueError("Plex URL and token required")
-    code, body = _request("/library/sections")
+    code, body = _request("/library/sections", base_url=base, token=tok)
     if code >= 400:
         raise ValueError(f"Plex sections failed ({code}): {body[:200]!r}")
     root = ET.fromstring(body)
@@ -87,17 +96,23 @@ def list_sections() -> list[dict[str, Any]]:
     return out
 
 
-def test_connection() -> dict[str, Any]:
+def test_connection(
+    *,
+    plex_url: str | None = None,
+    plex_token: str | None = None,
+) -> dict[str, Any]:
     """Verify token against /identity and list sections."""
-    if not _base_url():
+    base = (plex_url if plex_url is not None else _base_url()).strip().rstrip("/")
+    tok = (plex_token if plex_token is not None else _token()).strip()
+    if not base:
         return {"ok": False, "error": "Plex URL is empty"}
-    if not _token():
+    if not tok:
         return {"ok": False, "error": "Plex token is empty"}
-    code, body = _request("/identity")
+    code, body = _request("/identity", base_url=base, token=tok)
     if code >= 400:
         return {"ok": False, "error": f"Plex identity HTTP {code}: {body[:180]!r}"}
     try:
-        sections = list_sections()
+        sections = list_sections(plex_url=base, plex_token=tok)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
     machine = ""
@@ -213,12 +228,18 @@ def schedule_refresh(
 
     global _timer
     with _lock:
-        prev = _pending.get(key)
-        _pending[key] = fire_at if prev is None else min(prev, fire_at)
-        if _timer is None:
-            _timer = threading.Timer(debounce, _flush_pending)
-            _timer.daemon = True
-            _timer.start()
+        # Trailing debounce: keep delaying until activity stops
+        _pending[key] = fire_at
+        if _timer is not None:
+            try:
+                _timer.cancel()
+            except Exception:
+                pass
+            _timer = None
+        delay = max(0.1, fire_at - time.monotonic())
+        _timer = threading.Timer(delay, _flush_pending)
+        _timer.daemon = True
+        _timer.start()
 
 
 def notify_library_changed(

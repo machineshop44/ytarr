@@ -34,6 +34,7 @@ from ..schemas import (
     LoginOut,
     PlaylistEntriesResponse,
     PlaylistEntryOut,
+    PlexProbeIn,
     RenameApplyIn,
     RenameApplyOut,
     RenameItemOut,
@@ -141,6 +142,24 @@ def health() -> HealthOut:
             "Chrome/Edge often lock or encrypt the cookie DB on Windows — prefer Off + "
             "a Netscape cookies.txt, or Firefox. Settings → Download Clients."
         )
+    host = (cfg.host or "").strip()
+    if host in {"0.0.0.0", "::", "[::]"} and not auth_mod.forms_enabled(cfg) and not getattr(
+        cfg, "api_auth_required", True
+    ):
+        warnings.append(
+            "Listening on all interfaces with authentication disabled — "
+            "enable Forms login or API key auth, or bind to 127.0.0.1."
+        )
+    if (
+        auth_mod.forms_enabled(cfg)
+        and (cfg.username or "").strip().lower() == "machineshop44"
+        and auth_mod.verify_password("Winter123", cfg.password_hash or "")
+        and host in {"0.0.0.0", "::", "[::]"}
+    ):
+        warnings.append(
+            "Forms login still uses the default home-stack password while bound on the LAN. "
+            "Change it under Settings → General if this instance is reachable outside your house."
+        )
     status = "ok" if ok and not warnings else ("degraded" if not ok else "ok")
     if warnings and ok:
         status = "warning"
@@ -207,16 +226,24 @@ def auth_status(request: Request) -> AuthStatusOut:
 
 
 @router.post("/login", response_model=LoginOut)
-def login(body: LoginIn, response: Response) -> LoginOut:
+def login(body: LoginIn, response: Response, request: Request) -> LoginOut:
     cfg = ensure_auth_credentials(get_config())
     if not auth_mod.forms_enabled(cfg):
         raise HTTPException(status_code=400, detail="Forms authentication is disabled")
+    client = (request.client.host if request.client else "") or "unknown"
+    if auth_mod.login_is_locked(client):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed login attempts — try again in a few minutes",
+        )
     user = (body.username or "").strip()
     if user != (cfg.username or "").strip() or not auth_mod.verify_password(
         body.password or "", cfg.password_hash
     ):
+        auth_mod.record_login_failure(client)
         raise HTTPException(status_code=401, detail="Invalid username or password")
-    auth_mod.set_session_cookie(response, user)
+    auth_mod.record_login_success(client)
+    auth_mod.set_session_cookie(response, user, secure=request.url.scheme == "https")
     return LoginOut(ok=True, username=user, api_key=cfg.api_key or "")
 
 
@@ -524,10 +551,18 @@ def patch_source(
         # Normalize: comma-separated unique labels
         parts = [p.strip() for p in str(body.tags).split(",") if p.strip()]
         source.tags = ", ".join(dict.fromkeys(parts))
+    if body.parent_source_id is not None:
+        parent = db.get(MonitoredSource, int(body.parent_source_id))
+        if not parent:
+            raise HTTPException(status_code=400, detail="parent_source_id does not exist")
+        if (parent.source_type or "").lower() != "channel":
+            raise HTTPException(status_code=400, detail="parent_source_id must be a channel")
+        source.parent_source_id = int(body.parent_source_id)
     db.add(source)
     db.commit()
     db.refresh(source)
-    # Quality upgrade: re-queue downloaded episodes when quality preset changes
+    # Quality upgrade: re-queue downloaded episodes when quality preset changes.
+    # Keep the existing file until a new download succeeds (organize replaces it).
     new_quality = (source.quality or "").strip().lower()
     if body.quality is not None and new_quality and new_quality != old_quality:
         bumped = 0
@@ -535,6 +570,9 @@ def patch_source(
             if video.status == VideoStatus.DOWNLOADED.value:
                 video.status = VideoStatus.WANTED.value
                 video.error = f"Quality upgrade → {new_quality}"
+                # Clear path so twin-reuse / organize won't short-circuit on the old file
+                # for THIS source; twins under other sources are left alone.
+                video.file_path = None
                 db.add(video)
                 bumped += 1
         if bumped:
@@ -918,21 +956,38 @@ def rename_apply(body: RenameApplyIn, db: Session = Depends(get_db)) -> RenameAp
 
 
 @router.get("/connect/plex/sections")
-def plex_sections() -> dict:
+def plex_sections(
+    plex_url: str | None = None,
+    plex_token: str | None = None,
+) -> dict:
     from ..services import plex
 
     try:
-        sections = plex.list_sections()
+        sections = plex.list_sections(plex_url=plex_url, plex_token=plex_token)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"sections": sections}
 
 
 @router.post("/connect/plex/test")
-def plex_test() -> dict:
+def plex_test(body: PlexProbeIn | None = None) -> dict:
     from ..services import plex
 
-    return plex.test_connection()
+    body = body or PlexProbeIn()
+    return plex.test_connection(plex_url=body.plex_url, plex_token=body.plex_token)
+
+
+@router.post("/connect/plex/sections")
+def plex_sections_probe(body: PlexProbeIn | None = None) -> dict:
+    """List sections using draft form credentials (does not persist settings)."""
+    from ..services import plex
+
+    body = body or PlexProbeIn()
+    try:
+        sections = plex.list_sections(plex_url=body.plex_url, plex_token=body.plex_token)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"sections": sections}
 
 
 @router.post("/connect/plex/refresh")
@@ -956,24 +1011,38 @@ def system_tasks() -> dict:
 
 @router.post("/system/tasks/{task_id}/run")
 def run_system_task(task_id: str) -> dict:
+    """Kick a system task in the background so the HTTP worker is not blocked."""
     from ..db import SessionLocal
 
-    if task_id == "monitor":
-        db = SessionLocal()
-        try:
-            results = monitor.check_all_enabled(db)
-            downloader.enqueue_wanted(db)
-            return {"ok": True, "checked": len(results)}
-        finally:
-            db.close()
-    if task_id == "downloads":
-        downloader.worker_tick()
-        return {"ok": True}
-    if task_id == "ytdlp_update":
-        from ..services import ytdlp_update
+    known = {"monitor", "downloads", "ytdlp_update"}
+    if task_id not in known:
+        raise HTTPException(status_code=404, detail="Unknown task")
 
-        return ytdlp_update.maybe_update_ytdlp(force=True)
-    raise HTTPException(status_code=404, detail="Unknown task")
+    def _run() -> None:
+        try:
+            if task_id == "monitor":
+                db = SessionLocal()
+                try:
+                    monitor.check_all_enabled(db)
+                    downloader.enqueue_wanted(db)
+                finally:
+                    db.close()
+            elif task_id == "downloads":
+                downloader.worker_tick()
+            elif task_id == "ytdlp_update":
+                from ..services import ytdlp_update
+
+                ytdlp_update.maybe_update_ytdlp(force=True)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                from ..services import applog
+
+                applog.log_error(f"System task {task_id} failed: {exc}", source="tasks")
+            except Exception:
+                pass
+
+    threading.Thread(target=_run, name=f"ytarr-task-{task_id}", daemon=True).start()
+    return {"ok": True, "started": task_id, "async": True}
 
 
 @router.get("/system/backup")

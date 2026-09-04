@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy.orm import Session, object_session
+from sqlalchemy.orm import Session, joinedload, object_session
 
 from ..config import get_config
 from ..models import MonitoredSource, Video, VideoStatus
@@ -99,12 +99,24 @@ def season_number_for(source: MonitoredSource) -> int:
 
 
 def episode_number_for(video: Video) -> int:
+    """Stable episode number for filenames.
+
+    Prefer the assigned playlist/uploads number. If missing, derive a deterministic
+    fallback from the YouTube id so we never collapse everything to E01.
+    """
     n = getattr(video, "episode_number", None)
     try:
         ep = int(n) if n is not None else 0
     except (TypeError, ValueError):
         ep = 0
-    return max(1, min(ep or 1, 9999))
+    if ep > 0:
+        return max(1, min(ep, 9999))
+    # Stable 1..8999 fallback from video id (avoid E01 collisions)
+    vid = (video.video_id or "").strip() or str(getattr(video, "id", 0) or 0)
+    h = 0
+    for ch in vid:
+        h = (h * 33 + ord(ch)) & 0xFFFFFFFF
+    return 1000 + (h % 8000)
 
 
 def _music_artist_folder(

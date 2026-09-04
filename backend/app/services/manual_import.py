@@ -91,12 +91,33 @@ def import_files(
         if not path.exists() or not vid:
             skipped += 1
             continue
-        existing = (
-            db.query(Video)
-            .filter(Video.video_id == vid)
-            .order_by(Video.id.asc())
-            .first()
-        )
+        existing = None
+        if source:
+            existing = (
+                db.query(Video)
+                .filter(Video.source_id == source.id, Video.video_id == vid)
+                .order_by(Video.id.asc())
+                .first()
+            )
+        if existing is None:
+            existing = (
+                db.query(Video)
+                .filter(Video.video_id == vid)
+                .order_by(Video.id.asc())
+                .first()
+            )
+            # Prefer attaching under the selected series when twins exist
+            if existing and source and existing.source_id != source.id:
+                twin = (
+                    db.query(Video)
+                    .filter(Video.source_id == source.id, Video.video_id == vid)
+                    .first()
+                )
+                if twin:
+                    existing = twin
+                elif source:
+                    # Create under selected source rather than hijacking another series
+                    existing = None
         if existing:
             existing.file_path = str(path)
             existing.status = VideoStatus.DOWNLOADED.value
